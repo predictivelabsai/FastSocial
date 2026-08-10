@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FastSocial local and generated state
+.playwright/
+.playwright-cli/
+output/
+data/
+dist/
+build/
+*.egg-info/

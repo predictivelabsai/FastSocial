@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fastsocial
+          POSTGRES_PASSWORD: fastsocial
+          POSTGRES_DB: fastsocial
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fastsocial -d fastsocial"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://fastsocial:fastsocial@localhost:5432/fastsocial
+      APP_SECRET: ci-only-session-secret
+      TOKEN_ENCRYPTION_KEY: 4oAEcYhXwKvfvl6MNnLzK8TxN5TyPo-i1PhueLJNPF8=
+      SCHEDULER_ENABLED: "0"
+      MEDIA_LOCAL_DIR: /tmp/fastsocial-media
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint and format
+        run: |
+          ruff check fastsocial migrations tests
+          ruff format --check fastsocial migrations tests
+      - name: Migrate PostgreSQL
+        run: alembic upgrade head
+      - name: Test
+        run: pytest
+      - name: Build container
+        run: docker build -t fastsocial:${{ github.sha }} .
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.USE_COOLIFY_WEBHOOK == 'true'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify deployment
+        env:
+          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBHOOK_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          test -n "$COOLIFY_WEBHOOK_URL"
+          test -n "$COOLIFY_TOKEN"
+          curl --fail --show-error --silent --retry 3 \
+            "$COOLIFY_WEBHOOK_URL" \
+            -H "Authorization: Bearer $COOLIFY_TOKEN"
+
