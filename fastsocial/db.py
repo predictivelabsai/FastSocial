@@ -39,9 +39,7 @@ def engine() -> Engine:
                     max_overflow=configured.db_max_overflow,
                     pool_timeout=configured.db_pool_timeout,
                     pool_recycle=configured.db_pool_recycle,
-                    connect_args={
-                        "application_name": configured.db_application_name
-                    },
+                    connect_args={"application_name": configured.db_application_name},
                 )
             value = create_engine(url, **kwargs)
             if url.startswith("sqlite"):
