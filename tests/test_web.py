@@ -77,3 +77,16 @@ def test_health_and_static_css():
         stylesheet = client.get("/static/app.css")
         assert stylesheet.status_code == 200
         assert "--accent" in stylesheet.text
+
+
+def test_public_discovery_files_use_python_routes():
+    with TestClient(app) as client:
+        robots = client.get("/robots.txt")
+        assert robots.status_code == 200
+        assert robots.headers["content-type"].startswith("text/plain")
+        assert "Sitemap:" in robots.text
+
+        sitemap = client.get("/sitemap.xml")
+        assert sitemap.status_code == 200
+        assert sitemap.headers["content-type"].startswith("application/xml")
+        assert "<urlset" in sitemap.text

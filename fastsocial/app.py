@@ -19,6 +19,9 @@ app, rt = fast_app(
     secret_key=settings().app_secret,
     htmx=True,
 )
+# FastHTML registers its broad ``/{name}.{extension}`` matcher first. Keep
+# explicit application routes ahead of it so dynamic discovery files win.
+static_route = app.routes.pop(0)
 
 
 @rt("/healthz")
@@ -37,5 +40,7 @@ if settings().auto_create_schema:
     init_db()
 
 from fastsocial import routes as _routes  # noqa: E402,F401
+
+app.routes.append(static_route)
 
 start_scheduler()
