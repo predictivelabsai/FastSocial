@@ -235,6 +235,57 @@ class Media(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class MediaSourceConnection(Base):
+    __tablename__ = "media_source_connections"
+    __table_args__ = (
+        Index("ix_media_sources_workspace_provider", "workspace_id", "source_provider"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    source_provider: Mapped[str] = mapped_column(String(40), index=True)
+    connector_provider: Mapped[ConnectionProvider] = mapped_column(Enum(ConnectionProvider))
+    name: Mapped[str] = mapped_column(String(200))
+    external_account_id: Mapped[str] = mapped_column(String(500))
+    managed_user_id: Mapped[str] = mapped_column(String(500), default="")
+    list_tool: Mapped[str] = mapped_column(String(255), default="")
+    download_tool: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(40), default="connected", index=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ContentTemplate(Base):
+    __tablename__ = "content_templates"
+    __table_args__ = (
+        Index("ix_content_templates_workspace_updated", "workspace_id", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(240))
+    description: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String(100), default="general", index=True)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    media_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Post(Base):
     __tablename__ = "posts"
     __table_args__ = (
@@ -463,6 +514,47 @@ class InboxMessage(Base):
     message_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     conversation: Mapped[InboxConversation] = relationship(back_populates="messages")
+
+
+class InboxConversationTag(Base):
+    __tablename__ = "inbox_conversation_tags"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "name"),
+        Index("ix_inbox_tags_workspace_name", "workspace_id", "name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("inbox_conversations.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InboxModerationAction(Base):
+    __tablename__ = "inbox_moderation_actions"
+    __table_args__ = (
+        Index("ix_inbox_moderation_conversation_created", "conversation_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("inbox_conversations.id", ondelete="CASCADE"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    external_action_id: Mapped[str] = mapped_column(String(500), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SavedReply(Base):

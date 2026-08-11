@@ -27,6 +27,7 @@ from fastsocial.models import (
     ContentAutolist,
     InboxConversation,
     InboxMessage,
+    InboxModerationAction,
     ListeningMention,
     ListeningQuery,
     Media,
@@ -552,6 +553,70 @@ async def send_inbox_reply(
                 {"error": str(exc)},
             )
         result = message
+    if failure:
+        raise SocialAPIError(str(failure)) from failure
+    return result
+
+
+async def moderate_inbox_conversation(
+    conversation_id: uuid.UUID, user_id: uuid.UUID, action_name: str
+) -> InboxModerationAction:
+    """Execute a provider moderation action and retain an auditable delivery result."""
+    allowed = {"hide", "unhide", "delete", "like", "unlike", "report_spam"}
+    if action_name not in allowed:
+        raise ValueError("Unsupported moderation action")
+    failure: Exception | None = None
+    with session_scope() as session:
+        conversation = session.get(InboxConversation, conversation_id)
+        if not conversation or not conversation.social_account_id:
+            raise ValueError("This conversation has no connected moderation account")
+        account = session.get(SocialAccount, conversation.social_account_id)
+        if not account or account.workspace_id != conversation.workspace_id:
+            raise ValueError("The moderation account is unavailable")
+        action = InboxModerationAction(
+            workspace_id=conversation.workspace_id,
+            conversation_id=conversation.id,
+            action=action_name,
+            status="running",
+            requested_by=user_id,
+        )
+        session.add(action)
+        session.flush()
+        try:
+            moderator = getattr(client_for(account), "moderate_conversation", None)
+            if not moderator:
+                raise SocialAPIError(
+                    "Moderation is not available for this connection; map an Arcade or Composio tool"
+                )
+            action.external_action_id = await moderator(
+                account,
+                conversation.external_conversation_id,
+                action_name,
+                conversation.kind,
+            )
+            action.status = "completed"
+            if action_name == "report_spam":
+                conversation.status = "spam"
+            elif action_name == "delete":
+                conversation.status = "archived"
+            metadata = dict(conversation.conversation_metadata or {})
+            metadata["moderation_state"] = action_name
+            conversation.conversation_metadata = metadata
+            audit(session, conversation.workspace_id, user_id, "inbox.moderated", action)
+        except Exception as exc:
+            action.status = "failed"
+            action.error_message = str(exc)
+            failure = exc
+            audit(
+                session,
+                conversation.workspace_id,
+                user_id,
+                "inbox.moderation.failed",
+                action,
+                {"error": str(exc)},
+            )
+        action.completed_at = utcnow()
+        result = action
     if failure:
         raise SocialAPIError(str(failure)) from failure
     return result

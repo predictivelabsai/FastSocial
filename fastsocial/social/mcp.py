@@ -32,16 +32,15 @@ class ManagedMCPClient:
             self.user_header = "X-User-ID"
         self.provider = provider.value
 
-    async def _call(self, account: SocialAccount, tool: str, arguments: dict) -> dict:
+    async def call_tool(self, *, workspace_id, metadata: dict, tool: str, arguments: dict) -> dict:
+        """Call a managed tool for social or adjacent workspace integrations."""
         if not self.url or not self.api_key:
             raise SocialAPIError(f"{self.provider.title()} MCP is not configured")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            self.user_header: account.account_metadata.get(
-                "managed_user_id", str(account.workspace_id)
-            ),
+            self.user_header: metadata.get("managed_user_id", str(workspace_id)),
         }
         payload = {
             "jsonrpc": "2.0",
@@ -73,6 +72,14 @@ class ManagedMCPClient:
             raise SocialAPIError(f"MCP tool error: {body['error']}")
         return body.get("result", body)
 
+    async def _call(self, account: SocialAccount, tool: str, arguments: dict) -> dict:
+        return await self.call_tool(
+            workspace_id=account.workspace_id,
+            metadata=account.account_metadata,
+            tool=tool,
+            arguments=arguments,
+        )
+
     @staticmethod
     def _records(body: dict, preferred_key: str) -> list[dict]:
         """Accept common MCP structured and text-content result envelopes."""
@@ -93,6 +100,23 @@ class ManagedMCPClient:
             if isinstance(parsed, dict):
                 return ManagedMCPClient._records(parsed, preferred_key)
         return []
+
+    @staticmethod
+    def object_result(body: dict) -> dict:
+        """Normalize one-object MCP results, including JSON text content."""
+        candidate = body.get("structuredContent") if isinstance(body, dict) else None
+        if isinstance(candidate, dict):
+            return candidate
+        for item in body.get("content", []) if isinstance(body, dict) else []:
+            if item.get("type") != "text":
+                continue
+            try:
+                parsed = json.loads(item.get("text", ""))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return body if isinstance(body, dict) else {}
 
     @staticmethod
     def _datetime(value: object) -> datetime:
@@ -189,6 +213,24 @@ class ManagedMCPClient:
         if not message_id:
             raise SocialAPIError("MCP inbox tool did not return a message ID")
         return message_id
+
+    async def moderate_conversation(
+        self, account: SocialAccount, conversation_id: str, action: str, kind: str
+    ) -> str:
+        tool = account.account_metadata.get("inbox_moderation_tool")
+        if not tool:
+            raise SocialAPIError("No Inbox moderation MCP tool is configured for this account")
+        result = await self._call(
+            account,
+            tool,
+            {
+                "account_id": account.external_account_id,
+                "conversation_id": conversation_id,
+                "action": action,
+                "kind": kind,
+            },
+        )
+        return str(result.get("action_id") or result.get("id") or conversation_id)
 
     async def collect_inbox(self, account: SocialAccount, since: datetime) -> list[InboxItem]:
         tool = account.account_metadata.get("inbox_collect_tool")

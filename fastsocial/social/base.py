@@ -102,6 +102,10 @@ class SocialClient(Protocol):
         self, account: SocialAccount, conversation_id: str, body: str, kind: str
     ) -> str: ...
 
+    async def moderate_conversation(
+        self, account: SocialAccount, conversation_id: str, action: str, kind: str
+    ) -> str: ...
+
     async def collect_inbox(self, account: SocialAccount, since: datetime) -> list[InboxItem]: ...
 
     async def collect_ads(

@@ -272,7 +272,14 @@ MARKETING SKILLS:
             if chat:
                 chat.stage = WorkflowStage.failed
                 chat.status = "failed"
-                _event(session, chat.id, "generate", "failed", str(exc)[:240])
+                _event(
+                    session,
+                    chat.id,
+                    "generate",
+                    "failed",
+                    "The content model could not complete this generation",
+                    error_code=type(exc).__name__,
+                )
         raise
 
 

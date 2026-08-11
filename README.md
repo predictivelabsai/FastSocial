@@ -15,8 +15,10 @@ through configurable Arcade/Composio MCP gateways.
 - Encrypted credentials and OAuth tokens
 - Multi-account composer, drafts, scheduling, and month/week/list planner views with drag rescheduling
 - Evergreen Autolists with daily, weekly, or monthly round-robin publishing
+- Reusable post library plus atomic CSV bulk scheduling for drafts and timed campaigns
 - Best-time recommendations derived from the latest post-performance snapshots
 - Private local or Cloudflare R2 media library
+- Managed Canva, Google Drive, and Adobe Express media banks through Arcade/Composio MCP
 - Idempotent publishing worker with per-target retry state
 - Post/account metrics, server-rendered SVG analytics, and CSV export
 - Competitor profiles with historical growth/engagement snapshots and export
@@ -27,15 +29,17 @@ through configurable Arcade/Composio MCP gateways.
 - Keyword/hashtag listening with reach, engagement, sentiment, and direct X recent-search support
 - Privacy-safe real-time website analytics for pageviews, visitors, referrers, and conversions
 - Public SmartLinks with themes plus live view and click measurement
-- Tenant-safe unified inbox with assignment, priority, resolution, saved replies, and provider dispatch
+- Tenant-safe unified inbox with filters, bulk actions, notes, tags, moderation, assignment, saved replies, and provider dispatch
 - Personal publishing without approval; optional team approval workflow
 - Agentic Create / Generate → Review → Post chats with an optional autonomous YOLO mode
+- Persisted, user-safe execution traces streamed with HTMX SSE while copy and media generate
 - 49 editable, versioned marketing skills vendored from Corey's Marketing Skills
 - Encrypted xAI/OpenAI BYOK, configurable BYOM profiles, and gated server-key access
 - Text, image, and video generation with model and media provenance
 - PostgreSQL migrations, Docker, local tests, and Coolify CI/CD scaffolding
 
 The application and all business workflows are Python. The UI is rendered with FastHTML and HTMX;
+live creation uses only the standard HTMX core and SSE extension, with no custom browser event code.
 the Skills WYSIWYG uses a small isolated Quill adapter and has a Markdown fallback. Planner drag and
 drop is a progressively enhanced, route-specific script; the underlying reschedule flow remains a
 server-owned Python operation.

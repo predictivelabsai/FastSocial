@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import calendar as calendar_module
 import csv
 import hashlib
 import io
 import json
+import logging
 import secrets
 import uuid
 from datetime import UTC, date, datetime, timedelta
@@ -49,9 +51,11 @@ from fasthtml.common import (
     Tr,
     Ul,
 )
-from sqlalchemy import desc, func, select
+from fasthtml.xtend import sse_message
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.orm import selectinload
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from fastsocial.agentic import (
     create_chat_session,
@@ -103,10 +107,15 @@ from fastsocial.models import (
     ConnectionProvider,
     ContentArtifact,
     ContentAutolist,
+    ContentTemplate,
     InboxConversation,
+    InboxConversationTag,
+    InboxMessage,
+    InboxModerationAction,
     ListeningMention,
     ListeningQuery,
     Media,
+    MediaSourceConnection,
     ModelProfile,
     Post,
     PostApproval,
@@ -158,6 +167,7 @@ from fastsocial.services import (
     create_post,
     get_or_create_user,
     membership_for,
+    moderate_inbox_conversation,
     next_autolist_run,
     process_due_autolists,
     publish_post,
@@ -168,7 +178,12 @@ from fastsocial.services import (
     workspace_for_user,
 )
 from fastsocial.skills_service import publish_skill_version, skill_content
+from fastsocial.social.mcp import ManagedMCPClient
 from fastsocial.storage import LocalStorage, media_storage
+
+log = logging.getLogger(__name__)
+
+_CHAT_EXECUTION_TASKS: set[asyncio.Task] = set()
 
 
 class PageContext:
@@ -971,7 +986,13 @@ def _account_can_publish(account: SocialAccount) -> bool:
     )
 
 
-def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
+def _new_post_form(
+    ctx: PageContext,
+    sess: dict,
+    error: str = "",
+    initial_brief: str = "",
+    template_id: str = "",
+):
     account_options = [
         Label(
             Input(
@@ -1010,8 +1031,10 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
     )
     composer = Form(
         csrf_input(sess),
+        Input(type="hidden", name="template_id", value=template_id),
         Div(
             Textarea(
+                initial_brief,
                 name="brief",
                 placeholder="Describe the post you want to create…",
                 autofocus=True,
@@ -1168,16 +1191,41 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
 
 
 @rt("/new-post")
-async def new_post(request, sess):
+async def new_post(request, sess, template: str = ""):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
     if request.method == "GET":
+        initial_brief = ""
+        resolved_template_id = ""
+        if template:
+            try:
+                template_id = uuid.UUID(template)
+            except ValueError:
+                template_id = None
+            if template_id:
+                with session_scope() as session:
+                    reusable = session.scalar(
+                        select(ContentTemplate).where(
+                            ContentTemplate.id == template_id,
+                            ContentTemplate.workspace_id == ctx.workspace.id,
+                        )
+                    )
+                    if reusable:
+                        initial_brief = str(reusable.content.get("text") or "")
+                        resolved_template_id = str(reusable.id)
+                        reusable.use_count += 1
+                        reusable.last_used_at = utcnow()
         return _app_page(
             ctx,
             "New Post",
             "/new-post",
-            _new_post_form(ctx, sess),
+            _new_post_form(
+                ctx,
+                sess,
+                initial_brief=initial_brief,
+                template_id=resolved_template_id,
+            ),
         )
     form = await request.form()
     if not verify_csrf(sess, form.get("csrf")):
@@ -1207,7 +1255,37 @@ async def new_post(request, sess):
             "media_kinds": [str(item) for item in form.getlist("media_kinds")],
             "delivery": str(form.get("delivery") or "now"),
             "scheduled_at": str(form.get("scheduled_at") or ""),
+            "execution_action": "generate",
         }
+        submitted_template = str(form.get("template_id") or "")
+        if submitted_template:
+            try:
+                submitted_template_id = uuid.UUID(submitted_template)
+            except ValueError as exc:
+                raise ValueError("The selected content template is invalid") from exc
+            with session_scope() as session:
+                reusable = session.scalar(
+                    select(ContentTemplate).where(
+                        ContentTemplate.id == submitted_template_id,
+                        ContentTemplate.workspace_id == ctx.workspace.id,
+                    )
+                )
+                if not reusable:
+                    raise ValueError("The selected content template is unavailable")
+                requested_media = [uuid.UUID(value) for value in reusable.media_ids if value]
+                valid_media = (
+                    list(
+                        session.scalars(
+                            select(Media.id).where(
+                                Media.workspace_id == ctx.workspace.id,
+                                Media.id.in_(requested_media),
+                            )
+                        )
+                    )
+                    if requested_media
+                    else []
+                )
+                state["generated_media_ids"] = [str(item) for item in valid_media]
         if state["delivery"] == "schedule" and not _parse_datetime(
             state["scheduled_at"], ctx.workspace.timezone
         ):
@@ -1228,23 +1306,14 @@ async def new_post(request, sess):
                 workflow_mode=mode,
                 state=state,
             )
+            chat.status = "queued"
+            record_event(session, chat.id, "create", "queued", "Agent workflow queued")
             chat_id = chat.id
-        artifact_id = await generate_chat_artifact(chat_id, user_email=ctx.user.email)
-        if mode == WorkflowMode.yolo:
-            with session_scope() as session:
-                artifact = session.get(ContentArtifact, artifact_id)
-                prompts = dict(artifact.content)
-            for kind in state["media_kinds"]:
-                prompt = str(prompts.get(f"{kind}_prompt") or brief)
-                await generate_media_for_chat(
-                    chat_id,
-                    user_id=ctx.user.id,
-                    user_email=ctx.user.email,
-                    kind=kind,
-                    prompt=prompt,
-                )
-            await _deliver_chat(chat_id, ctx, delivery=state["delivery"])
-        return RedirectResponse(f"/chats/{chat_id}", status_code=303)
+        return RedirectResponse(
+            f"/chats/{chat_id}",
+            status_code=303,
+            background=BackgroundTask(_run_chat_workflow, chat_id, ctx),
+        )
     except Exception as exc:  # noqa: BLE001
         return _app_page(ctx, "New Post", "/new-post", _new_post_form(ctx, sess, str(exc)))
 
@@ -1281,6 +1350,141 @@ def _chat_records(ctx: PageContext, chat_id: str):
         return chat, messages, events, artifact
 
 
+def _claim_chat_workflow(chat_id: uuid.UUID, workspace_id: uuid.UUID) -> bool:
+    """Atomically claim a queued run so redirects and SSE reconnects cannot duplicate it."""
+    with session_scope() as session:
+        result = session.execute(
+            update(ChatSession)
+            .where(
+                ChatSession.id == chat_id,
+                ChatSession.workspace_id == workspace_id,
+                ChatSession.status == "queued",
+            )
+            .values(status="running", updated_at=utcnow())
+        )
+        return result.rowcount == 1
+
+
+async def _run_chat_workflow(chat_id: uuid.UUID, ctx: PageContext) -> None:
+    """Run one persisted agent action after the initiating HTTP response has been sent."""
+    if not _claim_chat_workflow(chat_id, ctx.workspace.id):
+        return
+    try:
+        with session_scope() as session:
+            chat = session.get(ChatSession, chat_id)
+            if not chat or chat.created_by != ctx.user.id:
+                raise ValueError("Chat not found")
+            state = dict(chat.state or {})
+            action = str(state.get("execution_action") or "generate")
+            workflow_mode = chat.workflow_mode
+
+        if action == "media":
+            kind = str(state.get("pending_media_kind") or "")
+            prompt = str(state.get("pending_media_prompt") or "").strip()
+            await generate_media_for_chat(
+                chat_id,
+                user_id=ctx.user.id,
+                user_email=ctx.user.email,
+                kind=kind,
+                prompt=prompt,
+            )
+            with session_scope() as session:
+                chat = session.get(ChatSession, chat_id)
+                artifact = latest_artifact(session, chat_id)
+                if chat:
+                    next_state = dict(chat.state or {})
+                    next_state.pop("pending_media_kind", None)
+                    next_state.pop("pending_media_prompt", None)
+                    next_state["execution_action"] = "generate"
+                    chat.state = next_state
+                    if artifact and artifact.status == ArtifactStatus.review:
+                        chat.stage = WorkflowStage.review
+                        chat.status = "awaiting_review"
+                    else:
+                        chat.stage = WorkflowStage.post
+                        chat.status = "active"
+            return
+
+        artifact_id = await generate_chat_artifact(chat_id, user_email=ctx.user.email)
+        if workflow_mode == WorkflowMode.yolo:
+            with session_scope() as session:
+                artifact = session.get(ContentArtifact, artifact_id)
+                if not artifact:
+                    raise ValueError("Generated artifact not found")
+                prompts = dict(artifact.content)
+            for kind in state.get("media_kinds", []):
+                prompt = str(prompts.get(f"{kind}_prompt") or "").strip()
+                await generate_media_for_chat(
+                    chat_id,
+                    user_id=ctx.user.id,
+                    user_email=ctx.user.email,
+                    kind=str(kind),
+                    prompt=prompt,
+                )
+            await _deliver_chat(chat_id, ctx, delivery=str(state.get("delivery") or "now"))
+        else:
+            with session_scope() as session:
+                chat = session.get(ChatSession, chat_id)
+                if chat and chat.status == "running":
+                    chat.status = "awaiting_review"
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Agent workflow failed for chat %s", chat_id)
+        with session_scope() as session:
+            chat = session.get(ChatSession, chat_id)
+            if chat:
+                chat.stage = WorkflowStage.failed
+                chat.status = "failed"
+                record_event(
+                    session,
+                    chat.id,
+                    "generate",
+                    "failed",
+                    "The agent workflow stopped before completion",
+                    error_code=type(exc).__name__,
+                )
+
+
+def _spawn_chat_workflow(chat_id: uuid.UUID, ctx: PageContext) -> None:
+    """Retain recovery tasks until completion if an SSE client finds a queued run."""
+    task = asyncio.create_task(_run_chat_workflow(chat_id, ctx))
+    _CHAT_EXECUTION_TASKS.add(task)
+    task.add_done_callback(_CHAT_EXECUTION_TASKS.discard)
+
+
+def _chat_live_signature(chat_id: uuid.UUID, workspace_id: uuid.UUID):
+    with session_scope() as session:
+        chat = session.scalar(
+            select(ChatSession).where(
+                ChatSession.id == chat_id,
+                ChatSession.workspace_id == workspace_id,
+            )
+        )
+        if not chat:
+            return None
+        event_sequence = (
+            session.scalar(
+                select(func.max(AgentEvent.sequence)).where(AgentEvent.chat_session_id == chat_id)
+            )
+            or 0
+        )
+        artifact = latest_artifact(session, chat_id)
+        media_count = len((chat.state or {}).get("generated_media_ids", []))
+        signature = (
+            chat.status,
+            chat.stage.value,
+            event_sequence,
+            artifact.version if artifact else 0,
+            media_count,
+        )
+        return signature, chat.status not in {"queued", "running"}
+
+
+def _safe_agent_event_label(event: AgentEvent) -> str:
+    if event.event_type == "failed":
+        return "This step failed. Check the model integration and try again."
+    return event.label
+
+
 def _chat_page(
     ctx: PageContext,
     sess: dict,
@@ -1293,6 +1497,7 @@ def _chat_page(
 ):
     content = dict(artifact.content) if artifact else {}
     completed = chat.stage == WorkflowStage.complete
+    processing = chat.status in {"queued", "running"}
     awaiting_approval = bool(artifact and artifact.status == ArtifactStatus.review)
     variants = content.get("variants") if isinstance(content.get("variants"), dict) else {}
     state = dict(chat.state or {})
@@ -1413,19 +1618,35 @@ def _chat_page(
             cls="creation-message-scroll agent-chat-messages",
         ),
         Details(
-            Summary(f"Agent activity · {len(events)} events"),
+            Summary(
+                Span(cls="agent-live-dot") if processing else "",
+                f"Execution trace · {len(events)} events",
+                Span("Working" if processing else chat.stage.value.title(), cls="trace-status"),
+            ),
             Ul(
                 *[
-                    Li(Span(event.stage.title(), cls="event-stage"), event.label)
+                    Li(
+                        Span(event.stage.title(), cls="event-stage"),
+                        _safe_agent_event_label(event),
+                    )
                     for event in events
                 ],
                 cls="agent-events",
             ),
             cls="agent-trace",
-            open=chat.stage in {WorkflowStage.generate, WorkflowStage.failed},
+            open=processing or chat.stage == WorkflowStage.failed,
         ),
         (
             Div(
+                Span(cls="agent-working-spinner"),
+                Div(
+                    Strong("Your agents are working"),
+                    Small("Create → Generate → Review. Results stream into this workspace."),
+                ),
+                cls="creation-processing-dock",
+            )
+            if processing
+            else Div(
                 Div(*action_forms, cls="chat-action-row") if action_forms else "",
                 Form(
                     csrf_input(sess),
@@ -1563,6 +1784,27 @@ def _chat_page(
     )
 
 
+def _chat_live_fragment(
+    ctx: PageContext,
+    sess: dict,
+    chat,
+    messages,
+    events,
+    artifact,
+    message: str = "",
+    error: str = "",
+):
+    return Div(
+        _chat_page(ctx, sess, chat, messages, events, artifact, message, error),
+        id="chat-live-fragment",
+        cls="chat-live-fragment",
+        hx_get=f"/chats/{chat.id}/live",
+        hx_trigger="sse:update",
+        hx_swap="outerHTML",
+        hx_sync="this:replace",
+    )
+
+
 @rt("/chats/{chat_id}")
 def chat_detail(chat_id: str, sess, saved: str = "", error: str = ""):
     ctx = _context(sess)
@@ -1576,11 +1818,97 @@ def chat_detail(chat_id: str, sess, saved: str = "", error: str = ""):
         "posted": "Post delivered to the publishing pipeline.",
         "media": "Generated media saved to the library.",
     }.get(saved, "")
+    fragment = _chat_live_fragment(
+        ctx,
+        sess,
+        chat,
+        messages,
+        events,
+        artifact,
+        saved_message,
+        error,
+    )
+    if chat.status in {"queued", "running"}:
+        content = (
+            Script(
+                src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js",
+                integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V",
+                crossorigin="anonymous",
+            ),
+            Script(
+                src="https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.4",
+                integrity="sha384-A986SAtodyH8eg8x8irJnYUk7i9inVQqYigD6qZ9evobksGNIXfeFvDwLSHcp31N",
+                crossorigin="anonymous",
+            ),
+            Div(
+                fragment,
+                hx_ext="sse",
+                sse_connect=f"/chats/{chat.id}/events",
+                sse_close="done",
+                cls="chat-sse-root",
+            ),
+        )
+    else:
+        content = (fragment,)
     return _app_page(
         ctx,
         chat.title,
         f"/chats/{chat.id}",
-        _chat_page(ctx, sess, chat, messages, events, artifact, saved_message, error),
+        *content,
+    )
+
+
+@rt("/chats/{chat_id}/live")
+def chat_live(chat_id: str, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    chat, messages, events, artifact = _chat_records(ctx, chat_id)
+    if not chat:
+        return Response("Not found", status_code=404)
+    return _chat_live_fragment(ctx, sess, chat, messages, events, artifact)
+
+
+@rt("/chats/{chat_id}/events")
+async def chat_events(chat_id: str, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    chat, _messages, _events, _artifact = _chat_records(ctx, chat_id)
+    if not chat:
+        return Response("Not found", status_code=404)
+
+    async def event_stream():
+        if chat.status == "queued":
+            _spawn_chat_workflow(chat.id, ctx)
+        yield "retry: 1000\n\n"
+        last_signature = None
+        for tick in range(3600):
+            current = _chat_live_signature(chat.id, ctx.workspace.id)
+            if current is None:
+                yield sse_message(Span("Conversation unavailable"), event="done")
+                return
+            signature, terminal = current
+            if signature != last_signature:
+                yield sse_message(Span("Refresh agent workspace"), event="update")
+                last_signature = signature
+            elif tick and tick % 30 == 0:
+                yield ": keep-alive\n\n"
+            if terminal:
+                await asyncio.sleep(0.2)
+                yield sse_message(Span("Agent workflow finished"), event="done")
+                return
+            await asyncio.sleep(0.5)
+        yield sse_message(Span("Live updates paused; reload to reconnect"), event="done")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -1601,13 +1929,17 @@ async def chat_message(chat_id: str, request, sess):
     with session_scope() as session:
         row = session.get(ChatSession, chat.id)
         session.add(ChatMessage(chat_session_id=row.id, role=ChatRole.user, content=value))
-        row.status = "active"
+        state = dict(row.state or {})
+        state["execution_action"] = "generate"
+        row.state = state
+        row.status = "queued"
         row.stage = WorkflowStage.create
-    try:
-        await generate_chat_artifact(chat.id, user_email=ctx.user.email)
-        return RedirectResponse(f"/chats/{chat.id}", status_code=303)
-    except Exception as exc:  # noqa: BLE001
-        return RedirectResponse(f"/chats/{chat.id}?error={quote_plus(str(exc))}", status_code=303)
+        record_event(session, row.id, "create", "queued", "Revision request queued")
+    return RedirectResponse(
+        f"/chats/{chat.id}",
+        status_code=303,
+        background=BackgroundTask(_run_chat_workflow, chat.id, ctx),
+    )
 
 
 @rt("/chats/{chat_id}/media", methods=["POST"])
@@ -1625,14 +1957,27 @@ async def chat_media(chat_id: str, request, sess):
         prompt = str(form.get("prompt") or "").strip()
         if not prompt:
             raise ValueError("Generation prompt is required")
-        await generate_media_for_chat(
-            chat.id,
-            user_id=ctx.user.id,
-            user_email=ctx.user.email,
-            kind=str(form.get("kind") or ""),
-            prompt=prompt,
+        kind = str(form.get("kind") or "")
+        if kind not in {"image", "video"}:
+            raise ValueError("Unsupported media kind")
+        with session_scope() as session:
+            row = session.get(ChatSession, chat.id)
+            state = dict(row.state or {})
+            state.update(
+                {
+                    "execution_action": "media",
+                    "pending_media_kind": kind,
+                    "pending_media_prompt": prompt,
+                }
+            )
+            row.state = state
+            row.status = "queued"
+            record_event(session, row.id, "generate", "queued", f"{kind.title()} generation queued")
+        return RedirectResponse(
+            f"/chats/{chat.id}",
+            status_code=303,
+            background=BackgroundTask(_run_chat_workflow, chat.id, ctx),
         )
-        return RedirectResponse(f"/chats/{chat.id}?saved=media", status_code=303)
     except Exception as exc:  # noqa: BLE001
         return RedirectResponse(f"/chats/{chat.id}?error={quote_plus(str(exc))}", status_code=303)
 
@@ -1821,8 +2166,160 @@ def _post_query(workspace_id):
     )
 
 
+@rt("/library")
+async def content_library(request, sess, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if request.method == "POST":
+        if ctx.membership.role == WorkspaceRole.viewer:
+            return Response("Forbidden", status_code=403)
+        form = await request.form()
+        if not verify_csrf(sess, form.get("csrf")):
+            return Response("Forbidden", status_code=403)
+        try:
+            name = str(form.get("name") or "").strip()
+            text = str(form.get("text") or "").strip()
+            category = slugify(str(form.get("category") or "general"))[:100]
+            tags = list(
+                dict.fromkeys(
+                    slugify(item.strip())[:80]
+                    for item in str(form.get("tags") or "").split(",")
+                    if item.strip()
+                )
+            )[:20]
+            if not name or not text:
+                raise ValueError("Template name and reusable content are required")
+            with session_scope() as session:
+                template = ContentTemplate(
+                    workspace_id=ctx.workspace.id,
+                    name=name[:240],
+                    description=str(form.get("description") or "").strip()[:2000],
+                    category=category,
+                    tags=tags,
+                    content={"text": text},
+                    created_by=ctx.user.id,
+                )
+                session.add(template)
+                session.flush()
+                audit(session, ctx.workspace.id, ctx.user.id, "template.created", template)
+            return RedirectResponse("/library?saved=1", status_code=303)
+        except Exception as exc:  # noqa: BLE001
+            return RedirectResponse(f"/library?error={quote_plus(str(exc))}", status_code=303)
+    with session_scope() as session:
+        templates = list(
+            session.scalars(
+                select(ContentTemplate)
+                .where(ContentTemplate.workspace_id == ctx.workspace.id)
+                .order_by(desc(ContentTemplate.updated_at))
+            )
+        )
+    cards = [
+        Div(
+            Div(
+                Div(
+                    Span(item.category.replace("-", " ").upper(), cls="eyebrow accent"),
+                    H2(item.name),
+                ),
+                Span(f"{item.use_count} uses", cls="mode-badge"),
+                cls="card-head",
+            ),
+            Div(
+                P(item.description or (item.content.get("text") or "")[:180]),
+                Div(*(Span(f"#{tag}", cls="template-tag") for tag in item.tags)),
+                cls="card-body template-copy",
+            ),
+            Div(
+                A("Use in agent chat", href=f"/new-post?template={item.id}", cls="btn primary"),
+                Form(
+                    csrf_input(sess),
+                    Button("Delete", type="submit", cls="btn danger small"),
+                    method="post",
+                    action=f"/library/{item.id}/delete",
+                )
+                if ctx.membership.role != WorkspaceRole.viewer
+                else "",
+                cls="template-actions",
+            ),
+            cls="card template-card",
+        )
+        for item in templates
+    ]
+    return _app_page(
+        ctx,
+        "Post Library",
+        "/library",
+        page_intro(
+            "REUSE",
+            "Turn proven ideas into repeatable content.",
+            "Save evergreen copy, campaign prompts, and media references, then reopen any item in the agentic creation flow.",
+            A("Bulk schedule CSV", href="/posts/import", cls="btn"),
+        ),
+        flash("Template saved." if saved else ""),
+        flash(error, "error"),
+        Div(
+            Div(H2("New reusable template"), cls="card-head"),
+            Form(
+                csrf_input(sess),
+                Input(name="name", placeholder="Product launch framework", required=True),
+                Input(name="category", placeholder="Campaign", value="general"),
+                Input(name="tags", placeholder="launch, product, evergreen"),
+                Input(name="description", placeholder="What this template is useful for"),
+                Textarea(
+                    name="text",
+                    placeholder="The reusable brief or base copy…",
+                    rows="5",
+                    required=True,
+                ),
+                Button("Save template", type="submit", cls="btn primary"),
+                method="post",
+                action="/library",
+                cls="template-form",
+            ),
+            cls="card",
+        )
+        if ctx.membership.role != WorkspaceRole.viewer
+        else "",
+        Div(*cards, cls="template-grid")
+        if cards
+        else empty_state(
+            "▦",
+            "No reusable posts yet",
+            "Save a post from its detail page or create a template above.",
+        ),
+    )
+
+
+@rt("/library/{template_id}/delete", methods=["POST"])
+async def content_template_delete(template_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(template_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        template = session.scalar(
+            select(ContentTemplate).where(
+                ContentTemplate.id == parsed,
+                ContentTemplate.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not template:
+            return Response("Not found", status_code=404)
+        audit(session, ctx.workspace.id, ctx.user.id, "template.deleted", template)
+        session.delete(template)
+    return RedirectResponse("/library?saved=deleted", status_code=303)
+
+
 @rt("/posts")
-def posts_page(sess, status: str = ""):
+def posts_page(sess, status: str = "", imported: int = 0, error: str = ""):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
@@ -1879,14 +2376,215 @@ def posts_page(sess, status: str = ""):
         ctx,
         "Posts",
         "/posts",
+        flash(f"Imported {imported} posts." if imported else ""),
+        flash(error, "error"),
         page_intro(
             "LIBRARY",
             "Every post, one dependable record.",
             "Filter drafts, scheduled work, published posts, and failures from the same workspace.",
         ),
         content,
-        action=A("+ New Post", href="/new-post", cls="btn primary"),
+        action=Div(
+            A("Bulk import", href="/posts/import", cls="btn"),
+            A("+ New Post", href="/new-post", cls="btn primary"),
+            cls="form-actions",
+        ),
     )
+
+
+@rt("/posts/import")
+async def posts_bulk_import(request, sess, error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    publish_accounts = [
+        account
+        for account in ctx.accounts
+        if account.status == AccountStatus.connected and _account_can_publish(account)
+    ]
+    if request.method == "POST":
+        form = await request.form()
+        if not verify_csrf(sess, form.get("csrf")):
+            return Response("Forbidden", status_code=403)
+        try:
+            upload = form.get("file")
+            if not upload or not getattr(upload, "filename", ""):
+                raise ValueError("Choose a CSV file")
+            body = await upload.read()
+            if len(body) > 5 * 1024 * 1024:
+                raise ValueError("CSV imports are limited to 5 MB")
+            try:
+                reader = csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
+                rows = list(reader)
+            except UnicodeDecodeError as exc:
+                raise ValueError("CSV must use UTF-8 encoding") from exc
+            if not rows or len(rows) > 500:
+                raise ValueError("CSV must contain between 1 and 500 posts")
+            if "text" not in (reader.fieldnames or []):
+                raise ValueError("CSV requires a text column")
+            mode = str(form.get("mode") or "schedule")
+            if mode not in {"draft", "schedule"}:
+                raise ValueError("Invalid import mode")
+            target_ids = [uuid.UUID(value) for value in form.getlist("target_ids")]
+            if mode == "schedule" and not target_ids:
+                raise ValueError("Select at least one publishing account")
+            with session_scope() as session:
+                workspace = session.get(Workspace, ctx.workspace.id)
+                for index, row in enumerate(rows, 2):
+                    text = str(row.get("text") or "").strip()
+                    if not text:
+                        raise ValueError(f"Row {index}: text is required")
+                    scheduled_at = _parse_datetime(
+                        str(row.get("scheduled_at") or "").strip(), workspace.timezone
+                    )
+                    if mode == "schedule" and not scheduled_at:
+                        raise ValueError(
+                            f"Row {index}: scheduled_at is required as YYYY-MM-DD HH:MM"
+                        )
+                    platform_text = {
+                        platform: str(row.get(platform) or "").strip()
+                        for platform in PLATFORM_NAMES
+                        if str(row.get(platform) or "").strip()
+                    }
+                    create_post(
+                        session,
+                        workspace=workspace,
+                        user_id=ctx.user.id,
+                        text=text,
+                        target_ids=target_ids,
+                        scheduled_at=scheduled_at,
+                        save_draft=mode == "draft",
+                        platform_text=platform_text,
+                    )
+                audit(
+                    session,
+                    ctx.workspace.id,
+                    ctx.user.id,
+                    "posts.bulk_imported",
+                    workspace,
+                    {"count": len(rows), "mode": mode},
+                )
+            return RedirectResponse(f"/posts?imported={len(rows)}", status_code=303)
+        except Exception as exc:  # noqa: BLE001
+            return RedirectResponse(f"/posts/import?error={quote_plus(str(exc))}", status_code=303)
+    account_options = [
+        Label(
+            Input(type="checkbox", name="target_ids", value=str(account.id), checked=True),
+            platform_pill(account.platform, account.display_name or account.username),
+            cls="account-option",
+        )
+        for account in publish_accounts
+    ]
+    return _app_page(
+        ctx,
+        "Bulk schedule",
+        "/posts",
+        page_intro(
+            "BULK PUBLISHING",
+            "Schedule up to 500 posts in one import.",
+            f"Times are interpreted in {ctx.workspace.timezone}. Imports are atomic: one invalid row rolls back the entire batch.",
+            A("Download CSV template", href="/posts/import-template.csv", cls="btn"),
+        ),
+        flash(error, "error"),
+        Form(
+            csrf_input(sess),
+            Div(
+                Label("CSV file"),
+                Input(type="file", name="file", accept=".csv,text/csv", required=True),
+                Small(
+                    "Columns: text, scheduled_at, plus optional x, linkedin, instagram, and other platform columns."
+                ),
+                cls="field",
+            ),
+            Div(
+                Label("Import mode"),
+                Select(
+                    Option("Schedule using CSV times", value="schedule", selected=True),
+                    Option("Save every row as a draft", value="draft"),
+                    name="mode",
+                ),
+                cls="field",
+            ),
+            Div(
+                Label("Publish to"),
+                Div(
+                    *(
+                        account_options
+                        or [P("Connect an account to schedule; draft import remains available.")]
+                    ),
+                    cls="account-options",
+                ),
+                cls="field",
+            ),
+            Button("Validate and import", type="submit", cls="btn primary"),
+            method="post",
+            action="/posts/import",
+            enctype="multipart/form-data",
+            cls="form-card bulk-import-form",
+        ),
+    )
+
+
+@rt("/posts/import-template.csv")
+def posts_import_template(sess):
+    if not _context(sess):
+        return Response("Unauthorized", status_code=401)
+    columns = ["text", "scheduled_at", *PLATFORM_NAMES]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=columns)
+    writer.writeheader()
+    writer.writerow(
+        {
+            "text": "Share one useful idea with a clear takeaway.",
+            "scheduled_at": "2026-09-01 09:00",
+            "x": "Optional X-specific version",
+            "linkedin": "Optional LinkedIn-specific version",
+        }
+    )
+    return Response(
+        output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=fastsocial-bulk-template.csv"},
+    )
+
+
+@rt("/posts/{post_id}/save-template", methods=["POST"])
+async def post_save_template(post_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(post_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        post = session.scalar(
+            select(Post)
+            .where(Post.id == parsed, Post.workspace_id == ctx.workspace.id)
+            .options(selectinload(Post.media_links))
+        )
+        if not post:
+            return Response("Not found", status_code=404)
+        name = str(form.get("name") or "").strip() or (post.content.get("text") or "Post")[:80]
+        template = ContentTemplate(
+            workspace_id=ctx.workspace.id,
+            name=name[:240],
+            category="saved-post",
+            content=dict(post.content or {}),
+            media_ids=[str(link.media_id) for link in post.media_links],
+            created_by=ctx.user.id,
+        )
+        session.add(template)
+        session.flush()
+        audit(session, ctx.workspace.id, ctx.user.id, "template.created_from_post", template)
+    return RedirectResponse(f"/posts/{post_id}?saved=template", status_code=303)
 
 
 @rt("/posts/{post_id}")
@@ -1985,12 +2683,28 @@ def post_detail(post_id: str, sess, saved: str = ""):
         ctx,
         "Post details",
         f"/posts/{post_id}",
-        flash("Post saved." if saved else ""),
+        flash(
+            "Saved to Post Library." if saved == "template" else ("Post saved." if saved else "")
+        ),
         page_intro(
             "POST",
             (post.content.get("text", "") or "Untitled post")[:80],
             f"Created {_format_datetime(post.created_at, ctx.workspace.timezone)}",
-            A("Back to posts", href="/posts", cls="btn"),
+            Div(
+                A("Back to posts", href="/posts", cls="btn"),
+                Form(
+                    csrf_input(sess),
+                    Input(
+                        type="hidden", name="name", value=(post.content.get("text") or "Post")[:80]
+                    ),
+                    Button("Save to library", type="submit", cls="btn primary"),
+                    method="post",
+                    action=f"/posts/{post.id}/save-template",
+                )
+                if ctx.membership.role != WorkspaceRole.viewer
+                else "",
+                cls="form-actions",
+            ),
         ),
         Div(
             Div(H2("Content"), status_badge(post.status), cls="card-head"),
@@ -2043,6 +2757,51 @@ def post_detail(post_id: str, sess, saved: str = ""):
             cls="card",
         ),
     )
+
+
+@rt("/integrations/accounts/{account_id}/capabilities", methods=["POST"])
+async def integration_capabilities_update(account_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(account_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    keys = (
+        "publish_tool",
+        "metrics_tool",
+        "account_metrics_tool",
+        "health_tool",
+        "inbox_collect_tool",
+        "inbox_reply_tool",
+        "inbox_moderation_tool",
+        "ads_metrics_tool",
+        "competitor_metrics_tool",
+        "listening_tool",
+    )
+    with session_scope() as session:
+        account = session.scalar(
+            select(SocialAccount).where(
+                SocialAccount.id == parsed,
+                SocialAccount.workspace_id == ctx.workspace.id,
+                SocialAccount.provider.in_(
+                    [ConnectionProvider.arcade, ConnectionProvider.composio]
+                ),
+            )
+        )
+        if not account:
+            return Response("Not found", status_code=404)
+        metadata = dict(account.account_metadata or {})
+        metadata.update({key: str(form.get(key) or "").strip()[:255] for key in keys})
+        account.account_metadata = metadata
+        audit(session, ctx.workspace.id, ctx.user.id, "integration.capabilities.updated", account)
+    return RedirectResponse(f"/integrations/accounts/{account_id}", status_code=303)
 
 
 @rt("/posts/{post_id}/approval", methods=["POST"])
@@ -3184,6 +3943,13 @@ def integrations_page(sess, saved: str = "", error: str = ""):
             .order_by(desc(CollectionRun.started_at))
             .limit(20)
         ).all()
+        media_sources = list(
+            session.scalars(
+                select(MediaSourceConnection)
+                .where(MediaSourceConnection.workspace_id == ctx.workspace.id)
+                .order_by(MediaSourceConnection.source_provider, MediaSourceConnection.name)
+            )
+        )
     collection_rows = [
         Div(
             Div(
@@ -3230,6 +3996,8 @@ def integrations_page(sess, saved: str = "", error: str = ""):
             if saved == "health"
             else "Live provider data synchronized."
             if saved == "collect"
+            else "Media source updated."
+            if saved == "media-source"
             else ("Integration connected." if saved else "")
         ),
         flash(error, "error"),
@@ -3263,6 +4031,72 @@ def integrations_page(sess, saved: str = "", error: str = ""):
         ),
         Div(
             Div(
+                Div(
+                    Span("MEDIA BANKS", cls="eyebrow accent"),
+                    H2("Canva, Google Drive, and Adobe Express"),
+                    P(
+                        "Map managed Arcade or Composio tools to browse and import approved creative files without storing downstream OAuth tokens."
+                    ),
+                ),
+                A("Open media bank", href="/media", cls="btn"),
+                cls="card-head",
+            ),
+            Div(
+                *(
+                    Div(
+                        Div(
+                            Strong(item.name),
+                            Small(
+                                f"{item.source_provider.replace('_', ' ').title()} · {item.connector_provider.value.title()} · {item.status}"
+                            ),
+                        ),
+                        Form(
+                            csrf_input(sess),
+                            Button("Disconnect", type="submit", cls="btn danger small"),
+                            method="post",
+                            action=f"/integrations/media-sources/{item.id}/delete",
+                        ),
+                        cls="report-schedule-row",
+                    )
+                    for item in media_sources
+                ),
+                cls="report-schedules",
+            )
+            if media_sources
+            else "",
+            Form(
+                csrf_input(sess),
+                Select(
+                    Option("Google Drive", value="google_drive"),
+                    Option("Canva", value="canva"),
+                    Option("Adobe Express", value="adobe_express"),
+                    name="source_provider",
+                ),
+                Select(
+                    Option("Arcade MCP", value="arcade"),
+                    Option("Composio MCP", value="composio"),
+                    name="connector_provider",
+                ),
+                Input(name="name", placeholder="Brand creative library", required=True),
+                Input(
+                    name="external_account_id", placeholder="Connected account ID", required=True
+                ),
+                Input(
+                    name="managed_user_id", placeholder="Managed user ID", value=str(ctx.user.id)
+                ),
+                Input(name="list_tool", placeholder="List/search tool (optional)"),
+                Input(name="download_tool", placeholder="Download/export tool", required=True),
+                Button("Connect media source", type="submit", cls="btn primary"),
+                method="post",
+                action="/integrations/media-sources",
+                cls="media-source-form",
+            )
+            if ctx.membership.role in {WorkspaceRole.owner, WorkspaceRole.admin}
+            else "",
+            cls="card integration-media-sources",
+        ),
+        Div(
+            Div(
                 H2("Collection activity"),
                 Small("Inbox every 10 minutes · Ads and competitors hourly"),
                 cls="card-head",
@@ -3273,6 +4107,81 @@ def integrations_page(sess, saved: str = "", error: str = ""):
             cls="card",
         ),
     )
+
+
+@rt("/integrations/media-sources", methods=["POST"])
+async def media_source_connect(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        source_provider = str(form.get("source_provider") or "")
+        connector_provider = ConnectionProvider(str(form.get("connector_provider") or ""))
+        if source_provider not in {
+            "google_drive",
+            "canva",
+            "adobe_express",
+        } or connector_provider not in {
+            ConnectionProvider.arcade,
+            ConnectionProvider.composio,
+        }:
+            raise ValueError("Choose a supported media source and managed connector")
+        name = str(form.get("name") or "").strip()
+        external_account_id = str(form.get("external_account_id") or "").strip()
+        download_tool = str(form.get("download_tool") or "").strip()
+        if not name or not external_account_id or not download_tool:
+            raise ValueError("Name, connected account ID, and download tool are required")
+        with session_scope() as session:
+            source = MediaSourceConnection(
+                workspace_id=ctx.workspace.id,
+                source_provider=source_provider,
+                connector_provider=connector_provider,
+                name=name[:200],
+                external_account_id=external_account_id[:500],
+                managed_user_id=str(form.get("managed_user_id") or ctx.user.id)[:500],
+                list_tool=str(form.get("list_tool") or "").strip()[:255],
+                download_tool=download_tool[:255],
+                created_by=ctx.user.id,
+            )
+            session.add(source)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "media_source.connected", source)
+        return RedirectResponse("/integrations?saved=media-source", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/integrations?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/integrations/media-sources/{source_id}/delete", methods=["POST"])
+async def media_source_disconnect(source_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(source_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        source = session.scalar(
+            select(MediaSourceConnection).where(
+                MediaSourceConnection.id == parsed,
+                MediaSourceConnection.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not source:
+            return Response("Not found", status_code=404)
+        audit(session, ctx.workspace.id, ctx.user.id, "media_source.disconnected", source)
+        session.delete(source)
+    return RedirectResponse("/integrations?saved=media-source", status_code=303)
 
 
 @rt("/integrations/models", methods=["POST"])
@@ -3473,6 +4382,7 @@ async def integration_connect(platform: str, provider: str, request, sess):
                     "health_tool",
                     "inbox_collect_tool",
                     "inbox_reply_tool",
+                    "inbox_moderation_tool",
                     "ads_metrics_tool",
                     "competitor_metrics_tool",
                     "listening_tool",
@@ -3601,6 +4511,12 @@ async def integration_connect(platform: str, provider: str, request, sess):
             Div(
                 Label("Inbox reply tool"),
                 Input(type="text", name="inbox_reply_tool", placeholder="Optional"),
+                cls="field",
+            ),
+            Div(
+                Label("Inbox moderation tool"),
+                Input(type="text", name="inbox_moderation_tool", placeholder="Optional"),
+                Small("Supports hide, unhide, like, unlike, spam reporting, and deletion."),
                 cls="field",
             ),
             Div(
@@ -3872,6 +4788,43 @@ def integration_account(account_id: str, sess):
             ),
             cls="card",
         ),
+        Div(
+            Div(H2("Managed capability mappings"), cls="card-head"),
+            Form(
+                csrf_input(sess),
+                *[
+                    Div(
+                        Label(label),
+                        Input(
+                            name=key,
+                            value=str(account.account_metadata.get(key) or ""),
+                            placeholder="Optional MCP tool name",
+                        ),
+                        cls="field",
+                    )
+                    for key, label in (
+                        ("publish_tool", "Publish"),
+                        ("metrics_tool", "Post metrics"),
+                        ("account_metrics_tool", "Account metrics"),
+                        ("health_tool", "Health check"),
+                        ("inbox_collect_tool", "Inbox collection"),
+                        ("inbox_reply_tool", "Inbox reply"),
+                        ("inbox_moderation_tool", "Inbox moderation"),
+                        ("ads_metrics_tool", "Ads metrics"),
+                        ("competitor_metrics_tool", "Competitor metrics"),
+                        ("listening_tool", "Listening"),
+                    )
+                ],
+                Button("Save mappings", type="submit", cls="btn primary"),
+                method="post",
+                action=f"/integrations/accounts/{account.id}/capabilities",
+                cls="capability-mapping-form",
+            ),
+            cls="card",
+        )
+        if account.provider in {ConnectionProvider.arcade, ConnectionProvider.composio}
+        and ctx.membership.role in {WorkspaceRole.owner, WorkspaceRole.admin}
+        else "",
     )
 
 
@@ -3906,8 +4859,10 @@ async def media_page(request, sess):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
-    error = ""
-    saved = False
+    error = str(request.query_params.get("error") or "")
+    saved = bool(request.query_params.get("saved"))
+    external_results = []
+    selected_source = None
     if request.method == "POST":
         form = await request.form()
         if not verify_csrf(sess, form.get("csrf")):
@@ -3937,6 +4892,36 @@ async def media_page(request, sess):
                 .order_by(desc(Media.created_at))
             )
         )
+        sources = list(
+            session.scalars(
+                select(MediaSourceConnection)
+                .where(MediaSourceConnection.workspace_id == ctx.workspace.id)
+                .order_by(MediaSourceConnection.name)
+            )
+        )
+        source_id = str(request.query_params.get("source") or "")
+        if source_id:
+            try:
+                parsed_source = uuid.UUID(source_id)
+            except ValueError:
+                parsed_source = None
+            if parsed_source:
+                selected_source = next((item for item in sources if item.id == parsed_source), None)
+    if selected_source and selected_source.list_tool:
+        try:
+            result = await ManagedMCPClient(selected_source.connector_provider).call_tool(
+                workspace_id=ctx.workspace.id,
+                metadata={"managed_user_id": selected_source.managed_user_id},
+                tool=selected_source.list_tool,
+                arguments={
+                    "account_id": selected_source.external_account_id,
+                    "query": str(request.query_params.get("q") or "")[:500],
+                    "limit": 50,
+                },
+            )
+            external_results = ManagedMCPClient._records(result, "files")
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
     cards = []
     for item in items:
         preview = (
@@ -3982,6 +4967,66 @@ async def media_page(request, sess):
         enctype="multipart/form-data",
         style="display:grid;gap:12px;margin-bottom:22px",
     )
+    external_cards = [
+        Div(
+            Div(
+                Strong(str(item.get("name") or item.get("filename") or "Creative file")[:160]),
+                Small(str(item.get("mime_type") or item.get("type") or "Remote asset")[:100]),
+            ),
+            Form(
+                csrf_input(sess),
+                Input(
+                    type="hidden",
+                    name="file_id",
+                    value=str(item.get("file_id") or item.get("id") or ""),
+                ),
+                Button("Import", type="submit", cls="btn primary small"),
+                method="post",
+                action=f"/media/import/{selected_source.id}" if selected_source else "/media",
+            ),
+            cls="report-schedule-row",
+        )
+        for item in external_results
+        if item.get("file_id") or item.get("id")
+    ]
+    source_panel = Div(
+        Div(
+            H2("Connected media banks"),
+            A("Configure", href="/integrations", cls="btn small"),
+            cls="card-head",
+        ),
+        Form(
+            Select(
+                Option("Choose a source", value=""),
+                *[
+                    Option(
+                        f"{item.name} · {item.source_provider.replace('_', ' ').title()}",
+                        value=str(item.id),
+                        selected=bool(selected_source and item.id == selected_source.id),
+                    )
+                    for item in sources
+                    if item.list_tool
+                ],
+                name="source",
+            ),
+            Input(
+                name="q",
+                placeholder="Search files, folders, or designs",
+                value=str(request.query_params.get("q") or ""),
+            ),
+            Button("Browse", type="submit", cls="btn"),
+            method="get",
+            action="/media",
+            cls="media-source-browser",
+        )
+        if any(item.list_tool for item in sources)
+        else P(
+            "Connect a Canva, Google Drive, or Adobe Express list/download tool in Integrations.",
+            cls="card-body form-help",
+        ),
+        Div(*external_cards, cls="report-schedules") if external_cards else "",
+        cls="card media-source-panel",
+    )
     return _app_page(
         ctx,
         "Media",
@@ -3993,7 +5038,7 @@ async def media_page(request, sess):
         ),
         flash("Media uploaded." if saved else ""),
         flash(error, "error"),
-        uploader,
+        Div(uploader, source_panel, cls="media-ingest-grid"),
         (
             Div(*cards, cls="media-grid")
             if cards
@@ -4004,6 +5049,87 @@ async def media_page(request, sess):
             )
         ),
     )
+
+
+@rt("/media/import/{source_id}", methods=["POST"])
+async def media_source_import(source_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(source_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    file_id = str(form.get("file_id") or "").strip()
+    if not file_id:
+        return RedirectResponse("/media?error=Remote+file+ID+is+required", status_code=303)
+    with session_scope() as session:
+        source = session.scalar(
+            select(MediaSourceConnection).where(
+                MediaSourceConnection.id == parsed,
+                MediaSourceConnection.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not source:
+            return Response("Not found", status_code=404)
+        connector_provider = source.connector_provider
+        metadata = {"managed_user_id": source.managed_user_id}
+        tool = source.download_tool
+        external_account_id = source.external_account_id
+    try:
+        result = await ManagedMCPClient(connector_provider).call_tool(
+            workspace_id=ctx.workspace.id,
+            metadata=metadata,
+            tool=tool,
+            arguments={"account_id": external_account_id, "file_id": file_id},
+        )
+        payload = ManagedMCPClient.object_result(result)
+        if isinstance(payload.get("file"), dict):
+            payload = payload["file"]
+        encoded = payload.get("content_base64") or payload.get("base64") or payload.get("data")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError(
+                "The managed download tool must return content_base64, filename, and mime_type"
+            )
+        try:
+            body = base64.b64decode(encoded, validate=True)
+        except ValueError as exc:
+            raise ValueError("The managed tool returned invalid base64 content") from exc
+        filename = str(payload.get("filename") or payload.get("name") or f"asset-{file_id}")
+        mime_type = str(payload.get("mime_type") or payload.get("content_type") or "")
+        with session_scope() as session:
+            source = session.get(MediaSourceConnection, parsed)
+            media = store_media(
+                session,
+                workspace_id=ctx.workspace.id,
+                user_id=ctx.user.id,
+                filename=filename[:500],
+                mime_type=mime_type,
+                body=body,
+            )
+            source.status = "connected"
+            source.last_error = ""
+            audit(
+                session,
+                ctx.workspace.id,
+                ctx.user.id,
+                "media.imported",
+                media,
+                {"source_id": str(source.id), "remote_file_id": file_id},
+            )
+        return RedirectResponse("/media?saved=imported", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        with session_scope() as session:
+            source = session.get(MediaSourceConnection, parsed)
+            if source:
+                source.status = "error"
+                source.last_error = str(exc)[:2000]
+        return RedirectResponse(f"/media?error={quote_plus(str(exc))}", status_code=303)
 
 
 @rt("/media/file/{key:path}")
@@ -6038,7 +7164,16 @@ def report_connector_feed(connector_id: str, token: str = "", days: int = 30):
 
 
 @rt("/inbox", methods=["GET"])
-def inbox_page(sess, status: str = "all"):
+def inbox_page(
+    sess,
+    status: str = "all",
+    platform: str = "all",
+    kind: str = "all",
+    priority: str = "all",
+    assigned: str = "all",
+    saved: str = "",
+    error: str = "",
+):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
@@ -6049,26 +7184,62 @@ def inbox_page(sess, status: str = "all"):
             .options(selectinload(InboxConversation.messages))
             .order_by(desc(InboxConversation.last_message_at))
         )
-        if status in {"unread", "open", "resolved"}:
+        if status in {"unread", "open", "resolved", "spam", "archived"}:
             query = query.where(InboxConversation.status == status)
+        if platform in PLATFORM_NAMES:
+            query = query.where(InboxConversation.platform == platform)
+        if kind in {"comment", "dm", "review", "mention"}:
+            query = query.where(InboxConversation.kind == kind)
+        if priority in {"low", "normal", "high", "urgent"}:
+            query = query.where(InboxConversation.priority == priority)
+        if assigned == "mine":
+            query = query.where(InboxConversation.assigned_to == ctx.user.id)
+        elif assigned == "unassigned":
+            query = query.where(InboxConversation.assigned_to.is_(None))
         conversations = list(session.scalars(query.limit(100)))
+        conversation_ids = [item.id for item in conversations]
+        tag_rows = (
+            list(
+                session.scalars(
+                    select(InboxConversationTag).where(
+                        InboxConversationTag.conversation_id.in_(conversation_ids)
+                    )
+                )
+            )
+            if conversation_ids
+            else []
+        )
+    tags_by_conversation: dict[uuid.UUID, list[str]] = {}
+    for tag in tag_rows:
+        tags_by_conversation.setdefault(tag.conversation_id, []).append(tag.name)
     rows = [
-        A(
-            Span(
-                PLATFORM_MARKS.get(item.platform, item.platform[:1].upper()),
-                cls=f"platform-mark {item.platform}",
-            ),
-            Div(
-                Div(
-                    Strong(item.participant_name or item.participant_handle or "Social user"),
-                    Span(item.kind.title(), cls="mode-badge"),
+        Div(
+            Input(type="checkbox", name="conversation_ids", value=str(item.id)),
+            A(
+                Span(
+                    PLATFORM_MARKS.get(item.platform, item.platform[:1].upper()),
+                    cls=f"platform-mark {item.platform}",
                 ),
-                P(item.last_message_preview or "No preview available"),
-                Small(_format_datetime(item.last_message_at, ctx.workspace.timezone)),
+                Div(
+                    Div(
+                        Strong(item.participant_name or item.participant_handle or "Social user"),
+                        Span(item.kind.title(), cls="mode-badge"),
+                    ),
+                    P(item.last_message_preview or "No preview available"),
+                    Div(
+                        Small(_format_datetime(item.last_message_at, ctx.workspace.timezone)),
+                        *(
+                            Span(f"#{tag}", cls="template-tag")
+                            for tag in tags_by_conversation.get(item.id, [])
+                        ),
+                        cls="inbox-row-meta",
+                    ),
+                ),
+                Span(item.status.upper(), cls=f"inbox-state {item.status}"),
+                href=f"/inbox/{item.id}",
+                cls="inbox-row inbox-row-link",
             ),
-            Span(item.status.upper(), cls=f"inbox-state {item.status}"),
-            href=f"/inbox/{item.id}",
-            cls="inbox-row",
+            cls="inbox-select-row",
         )
         for item in conversations
     ]
@@ -6081,14 +7252,87 @@ def inbox_page(sess, status: str = "all"):
             "One place for every conversation.",
             "Triage comments, direct messages, and reviews, assign ownership, and reply through connected providers.",
         ),
-        Div(
-            A("All", href="/inbox", cls="btn small"),
-            A("Unread", href="/inbox?status=unread", cls="btn small"),
-            A("Open", href="/inbox?status=open", cls="btn small"),
-            A("Resolved", href="/inbox?status=resolved", cls="btn small"),
-            cls="inbox-filters",
+        flash("Inbox updated." if saved else ""),
+        flash(error, "error"),
+        Form(
+            Select(
+                *[
+                    Option(label, value=value, selected=status == value)
+                    for value, label in (
+                        ("all", "All statuses"),
+                        ("unread", "Unread"),
+                        ("open", "Open"),
+                        ("resolved", "Resolved"),
+                        ("spam", "Spam"),
+                        ("archived", "Archived"),
+                    )
+                ],
+                name="status",
+            ),
+            Select(
+                Option("All platforms", value="all"),
+                *[
+                    Option(name, value=value, selected=platform == value)
+                    for value, name in PLATFORM_NAMES.items()
+                ],
+                name="platform",
+            ),
+            Select(
+                *[
+                    Option(label, value=value, selected=kind == value)
+                    for value, label in (
+                        ("all", "All types"),
+                        ("comment", "Comments"),
+                        ("dm", "Direct messages"),
+                        ("review", "Reviews"),
+                        ("mention", "Mentions"),
+                    )
+                ],
+                name="kind",
+            ),
+            Select(
+                *[
+                    Option(label, value=value, selected=priority == value)
+                    for value, label in (
+                        ("all", "All priorities"),
+                        ("urgent", "Urgent"),
+                        ("high", "High"),
+                        ("normal", "Normal"),
+                        ("low", "Low"),
+                    )
+                ],
+                name="priority",
+            ),
+            Select(
+                Option("Any assignee", value="all", selected=assigned == "all"),
+                Option("Assigned to me", value="mine", selected=assigned == "mine"),
+                Option("Unassigned", value="unassigned", selected=assigned == "unassigned"),
+                name="assigned",
+            ),
+            Button("Filter", type="submit", cls="btn"),
+            method="get",
+            action="/inbox",
+            cls="inbox-filter-form",
         ),
-        Div(*rows, cls="card inbox-list")
+        Form(
+            csrf_input(sess),
+            Div(
+                Select(
+                    Option("Mark open", value="open"),
+                    Option("Resolve", value="resolved"),
+                    Option("Mark unread", value="unread"),
+                    Option("Move to spam", value="spam"),
+                    Option("Archive", value="archived"),
+                    name="action",
+                ),
+                Button("Apply to selected", type="submit", cls="btn"),
+                cls="inbox-bulk-controls",
+            ),
+            Div(*rows, cls="card inbox-list"),
+            method="post",
+            action="/inbox/bulk",
+            cls="inbox-bulk-form",
+        )
         if rows
         else empty_state(
             "✉",
@@ -6133,12 +7377,31 @@ def inbox_conversation_page(conversation_id: str, sess, saved: str = "", error: 
             .where(WorkspaceMember.workspace_id == ctx.workspace.id)
             .order_by(User.name, User.email)
         ).all()
+        tags = list(
+            session.scalars(
+                select(InboxConversationTag)
+                .where(InboxConversationTag.conversation_id == conversation.id)
+                .order_by(InboxConversationTag.name)
+            )
+        )
+        moderation_actions = list(
+            session.scalars(
+                select(InboxModerationAction)
+                .where(InboxModerationAction.conversation_id == conversation.id)
+                .order_by(desc(InboxModerationAction.created_at))
+                .limit(10)
+            )
+        )
     messages = [
         Div(
             Div(
                 Strong(
                     message.sender_name
-                    or ("You" if message.direction == "outbound" else "Social user")
+                    or (
+                        "Internal note"
+                        if message.direction == "internal"
+                        else ("You" if message.direction == "outbound" else "Social user")
+                    )
                 ),
                 Small(_format_datetime(message.sent_at, ctx.workspace.timezone)),
                 cls="inbox-message-head",
@@ -6189,6 +7452,19 @@ def inbox_conversation_page(conversation_id: str, sess, saved: str = "", error: 
                     action=f"/inbox/{conversation.id}/reply",
                     cls="inbox-reply-form",
                 ),
+                Form(
+                    csrf_input(sess),
+                    Textarea(
+                        name="body",
+                        placeholder="Add an internal note for your team…",
+                        required=True,
+                        rows="2",
+                    ),
+                    Button("Add private note", type="submit", cls="btn"),
+                    method="post",
+                    action=f"/inbox/{conversation.id}/notes",
+                    cls="inbox-note-form",
+                ),
                 cls="card inbox-thread-card",
             ),
             Div(
@@ -6204,7 +7480,7 @@ def inbox_conversation_page(conversation_id: str, sess, saved: str = "", error: 
                                     value=value,
                                     selected=conversation.status == value,
                                 )
-                                for value in ("unread", "open", "resolved")
+                                for value in ("unread", "open", "resolved", "spam", "archived")
                             ],
                             name="status",
                         ),
@@ -6237,6 +7513,64 @@ def inbox_conversation_page(conversation_id: str, sess, saved: str = "", error: 
                         method="post",
                         action=f"/inbox/{conversation.id}/triage",
                         cls="inbox-triage-form",
+                    ),
+                    cls="card inbox-side-card",
+                ),
+                Div(
+                    H2("Labels"),
+                    Div(*(Span(f"#{item.name}", cls="template-tag") for item in tags)),
+                    Form(
+                        csrf_input(sess),
+                        Input(name="name", placeholder="vip-customer", required=True),
+                        Button("Add label", type="submit", cls="btn small"),
+                        method="post",
+                        action=f"/inbox/{conversation.id}/tags",
+                        cls="inbox-tag-form",
+                    ),
+                    cls="card inbox-side-card",
+                ),
+                Div(
+                    H2("Moderation"),
+                    P(
+                        "Provider actions require an Inbox moderation tool on the connected Arcade or Composio account.",
+                        cls="form-help",
+                    ),
+                    Div(
+                        *[
+                            Form(
+                                csrf_input(sess),
+                                Input(type="hidden", name="action", value=action_name),
+                                Button(
+                                    label,
+                                    type="submit",
+                                    cls=f"btn small{' danger' if action_name in {'delete', 'report_spam'} else ''}",
+                                ),
+                                method="post",
+                                action=f"/inbox/{conversation.id}/moderate",
+                            )
+                            for action_name, label in (
+                                ("hide", "Hide"),
+                                ("unhide", "Unhide"),
+                                ("like", "Like"),
+                                ("unlike", "Unlike"),
+                                ("report_spam", "Report spam"),
+                                ("delete", "Delete on network"),
+                            )
+                        ],
+                        cls="moderation-actions",
+                    ),
+                    Div(
+                        *[
+                            Div(
+                                Strong(item.action.replace("_", " ").title()),
+                                Small(
+                                    item.status.upper()
+                                    + (f" · {item.error_message}" if item.error_message else "")
+                                ),
+                                cls="saved-reply",
+                            )
+                            for item in moderation_actions
+                        ]
                     ),
                     cls="card inbox-side-card",
                 ),
@@ -6284,7 +7618,7 @@ async def inbox_triage(conversation_id: str, request, sess):
         return Response("Invalid conversation", status_code=400)
     status = str(form.get("status") or "open")
     priority = str(form.get("priority") or "normal")
-    if status not in {"unread", "open", "resolved"} or priority not in {
+    if status not in {"unread", "open", "resolved", "spam", "archived"} or priority not in {
         "low",
         "normal",
         "high",
@@ -6307,6 +7641,164 @@ async def inbox_triage(conversation_id: str, request, sess):
         conversation.assigned_to = assigned
         audit(session, ctx.workspace.id, ctx.user.id, "inbox.triaged", conversation)
     return RedirectResponse(f"/inbox/{conversation_id}?saved=1", status_code=303)
+
+
+@rt("/inbox/bulk", methods=["POST"])
+async def inbox_bulk_triage(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    action = str(form.get("action") or "")
+    if action not in {"unread", "open", "resolved", "spam", "archived"}:
+        return Response("Invalid bulk action", status_code=400)
+    try:
+        ids = list(dict.fromkeys(uuid.UUID(value) for value in form.getlist("conversation_ids")))
+    except ValueError:
+        return Response("Invalid conversation", status_code=400)
+    if not ids:
+        return RedirectResponse("/inbox?error=Select+at+least+one+conversation", status_code=303)
+    with session_scope() as session:
+        conversations = list(
+            session.scalars(
+                select(InboxConversation).where(
+                    InboxConversation.workspace_id == ctx.workspace.id,
+                    InboxConversation.id.in_(ids),
+                )
+            )
+        )
+        if len(conversations) != len(ids):
+            return Response("Not found", status_code=404)
+        for conversation in conversations:
+            conversation.status = action
+            audit(
+                session,
+                ctx.workspace.id,
+                ctx.user.id,
+                "inbox.bulk_triaged",
+                conversation,
+                {"status": action},
+            )
+    return RedirectResponse("/inbox?saved=bulk", status_code=303)
+
+
+@rt("/inbox/{conversation_id}/notes", methods=["POST"])
+async def inbox_internal_note(conversation_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(conversation_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    body = str(form.get("body") or "").strip()
+    if not body:
+        return RedirectResponse(f"/inbox/{conversation_id}?error=Note+is+required", status_code=303)
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(InboxConversation).where(
+                InboxConversation.id == parsed,
+                InboxConversation.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not conversation:
+            return Response("Not found", status_code=404)
+        note = InboxMessage(
+            conversation_id=conversation.id,
+            direction="internal",
+            sender_name=ctx.user.name or ctx.user.email,
+            body=body[:10000],
+            delivery_status="internal",
+        )
+        session.add(note)
+        session.flush()
+        audit(session, ctx.workspace.id, ctx.user.id, "inbox.note.created", note)
+    return RedirectResponse(f"/inbox/{conversation_id}?saved=note", status_code=303)
+
+
+@rt("/inbox/{conversation_id}/tags", methods=["POST"])
+async def inbox_tag_add(conversation_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(conversation_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    name = slugify(str(form.get("name") or ""))[:80]
+    if not name:
+        return RedirectResponse(
+            f"/inbox/{conversation_id}?error=Label+is+required", status_code=303
+        )
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(InboxConversation).where(
+                InboxConversation.id == parsed,
+                InboxConversation.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not conversation:
+            return Response("Not found", status_code=404)
+        exists = session.scalar(
+            select(InboxConversationTag.id).where(
+                InboxConversationTag.conversation_id == conversation.id,
+                InboxConversationTag.name == name,
+            )
+        )
+        if not exists:
+            tag = InboxConversationTag(
+                workspace_id=ctx.workspace.id,
+                conversation_id=conversation.id,
+                name=name,
+                created_by=ctx.user.id,
+            )
+            session.add(tag)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "inbox.tag.created", tag)
+    return RedirectResponse(f"/inbox/{conversation_id}?saved=tag", status_code=303)
+
+
+@rt("/inbox/{conversation_id}/moderate", methods=["POST"])
+async def inbox_moderate(conversation_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(conversation_id)
+        with session_scope() as session:
+            exists = session.scalar(
+                select(InboxConversation.id).where(
+                    InboxConversation.id == parsed,
+                    InboxConversation.workspace_id == ctx.workspace.id,
+                )
+            )
+        if not exists:
+            return Response("Not found", status_code=404)
+        await moderate_inbox_conversation(parsed, ctx.user.id, str(form.get("action") or ""))
+        return RedirectResponse(f"/inbox/{conversation_id}?saved=moderated", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(
+            f"/inbox/{conversation_id}?error={quote_plus(str(exc))}", status_code=303
+        )
 
 
 @rt("/inbox/{conversation_id}/reply", methods=["POST"])
