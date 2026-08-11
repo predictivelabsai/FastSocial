@@ -48,20 +48,61 @@ jobs:
       - name: Build container
         run: docker build -t fastsocial:${{ github.sha }} .
 
-  # Optional alternative to the canonical direct GitHub→Coolify repository webhook.
-  # Keep disabled while that push-only webhook is active to avoid duplicate deployments.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.USE_COOLIFY_WEBHOOK == 'true'
     needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Coolify deployment
+        id: deploy
+        timeout-minutes: 4
         env:
-          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBHOOK_URL }}
-          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+          COOLIFY_BASE_URL: ${{ vars.COOLIFY_BASE_URL }}
         run: |
-          test -n "$COOLIFY_WEBHOOK_URL"
-          test -n "$COOLIFY_TOKEN"
-          curl --fail --show-error --silent --retry 3 \
-            "$COOLIFY_WEBHOOK_URL" \
-            -H "Authorization: Bearer $COOLIFY_TOKEN"
+          test -n "$COOLIFY_API_TOKEN"
+          test -n "$COOLIFY_APP_UUID"
+          test -n "$COOLIFY_BASE_URL"
+          response=$(curl --fail --silent --show-error \
+            --request POST \
+            --connect-timeout 10 --max-time 60 \
+            --header "Authorization: Bearer ${COOLIFY_API_TOKEN}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "{\"uuid\":\"${COOLIFY_APP_UUID}\"}" \
+            "${COOLIFY_BASE_URL%/}/api/v1/deploy")
+          deployment_uuid=$(jq -er '.deployments[0].deployment_uuid' <<<"$response")
+          echo "deployment_uuid=$deployment_uuid" >> "$GITHUB_OUTPUT"
+      - name: Wait for Coolify
+        timeout-minutes: 18
+        env:
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          COOLIFY_BASE_URL: ${{ vars.COOLIFY_BASE_URL }}
+          DEPLOYMENT_UUID: ${{ steps.deploy.outputs.deployment_uuid }}
+        run: |
+          for _ in $(seq 1 100); do
+            status=$(curl --fail --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --retry 2 --retry-delay 3 --retry-all-errors \
+              --header "Authorization: Bearer ${COOLIFY_API_TOKEN}" \
+              --header "Accept: application/json" \
+              "${COOLIFY_BASE_URL%/}/api/v1/deployments/${DEPLOYMENT_UUID}" \
+              | jq -r '.status')
+            echo "Coolify status: $status"
+            case "$status" in
+              finished) exit 0 ;;
+              failed|cancelled|cancelled-by-user) exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "Deployment timed out" >&2
+          exit 1
+      - name: Verify production
+        run: |
+          response=$(curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --retry 12 --retry-delay 5 --retry-all-errors \
+            https://fastsocial.org/healthz)
+          jq -e '.status == "ok" and .service == "fastsocial" and .version == "0.1.1"' \
+            <<<"$response"
