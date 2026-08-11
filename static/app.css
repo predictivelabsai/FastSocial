@@ -379,6 +379,19 @@ td { padding: 12px; border-top: 1px solid var(--line); vertical-align: middle; }
 .report-schedule-form { padding: 15px; display: grid; gap: 9px; }
 .report-schedule-form label { color: var(--muted); font-size: 10px; }
 .report-schedule-form label input { width: auto; }
+.report-studio-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.report-studio-form { padding: 15px; display: grid; gap: 10px; }
+.report-studio-form textarea { min-height: 112px; resize: vertical; }
+.report-studio-controls { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+.studio-result { display: grid; gap: 9px; }
+.studio-result h3 { margin: 8px 0 0; font-size: 12px; }
+.studio-result ul { margin: 0; padding-left: 20px; color: var(--ink); }
+.studio-result li { margin: 5px 0; line-height: 1.45; }
+.studio-summary { font-size: 14px; line-height: 1.55; }
+.studio-history { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 15px 15px; }
+.studio-history-link { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; color: var(--muted); font-size: 9px; }
+.report-connectors-card { margin-top: 16px; }
+.report-connector-form { padding: 15px; display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 8px; border-top: 1px solid var(--line); }
 .report-delivery-note { padding: 0 15px 15px; display: block; color: var(--muted); font-size: 9px; line-height: 1.45; }
 
 .ads-import-form { padding: 18px; }
@@ -537,7 +550,8 @@ td { padding: 12px; border-top: 1px solid var(--line); vertical-align: middle; }
   .creation-workspace { grid-template-columns: minmax(430px, 1fr) 340px; }
   .prompt-suggestions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .composer-controls-grid { grid-template-columns: 1fr; }
-  .planner-layout, .reports-layout, .smartlink-editor-layout, .inbox-detail-layout, .website-panels { grid-template-columns: 1fr; }
+  .planner-layout, .reports-layout, .report-studio-grid, .smartlink-editor-layout, .inbox-detail-layout, .website-panels { grid-template-columns: 1fr; }
+  .report-studio-controls, .report-connector-form { grid-template-columns: 1fr; }
   .ads-import-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .best-times-card, .smartlink-preview-shell { position: static; }
   .competitor-add-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

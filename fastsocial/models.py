@@ -527,6 +527,45 @@ class ReportRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ReportNarrative(Base):
+    __tablename__ = "report_narratives"
+    __table_args__ = (
+        Index("ix_report_narratives_workspace_created", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    prompt: Mapped[str] = mapped_column(Text)
+    report_days: Mapped[int] = mapped_column(Integer, default=30)
+    title: Mapped[str] = mapped_column(String(255), default="Performance brief")
+    executive_summary: Mapped[str] = mapped_column(Text, default="")
+    insights: Mapped[list[str]] = mapped_column(JSON, default=list)
+    recommendations: Mapped[list[str]] = mapped_column(JSON, default=list)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model_name: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ReportConnector(Base):
+    __tablename__ = "report_connectors"
+    __table_args__ = (Index("ix_report_connectors_workspace_active", "workspace_id", "active"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    token_hint: Mapped[str] = mapped_column(String(20), default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ContentAutolist(Base):
     __tablename__ = "content_autolists"
     __table_args__ = (Index("ix_autolists_workspace_due", "workspace_id", "active", "next_run_at"),)

@@ -20,7 +20,8 @@ through configurable Arcade/Composio MCP gateways.
 - Idempotent publishing worker with per-target retry state
 - Post/account metrics, server-rendered SVG analytics, and CSV export
 - Competitor profiles with historical growth/engagement snapshots and export
-- Unified brand reports with printable/R2 artifacts, scheduled runs, and optional Postmark delivery
+- Unified brand reports with native PDF/editable PowerPoint/R2 artifacts and scheduled Postmark delivery
+- Grounded xAI/OpenAI Report Studio narratives plus revocable JSON feeds for BI, MCP, and custom dashboards
 - Meta, Google, and TikTok Ads campaign snapshots with spend, CPC, conversion, ROAS, and CSV export
 - Scheduled live provider collectors with per-account run history and exact failure visibility
 - Keyword/hashtag listening with reach, engagement, sentiment, and direct X recent-search support

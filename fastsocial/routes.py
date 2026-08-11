@@ -5,6 +5,7 @@ import calendar as calendar_module
 import csv
 import hashlib
 import io
+import json
 import secrets
 import uuid
 from datetime import UTC, date, datetime, timedelta
@@ -112,6 +113,8 @@ from fastsocial.models import (
     PostMetric,
     PostStatus,
     PostTarget,
+    ReportConnector,
+    ReportNarrative,
     ReportRun,
     ReportSchedule,
     SavedReply,
@@ -132,7 +135,14 @@ from fastsocial.models import (
     WorkspaceSkillVersion,
     utcnow,
 )
-from fastsocial.reporting import execute_report_schedule, render_report_html, report_summary
+from fastsocial.reporting import (
+    execute_report_schedule,
+    render_report_html,
+    render_report_pdf,
+    render_report_pptx,
+    report_json,
+    report_summary,
+)
 from fastsocial.security import (
     csrf_token,
     encrypt_text,
@@ -5289,7 +5299,13 @@ def website_track(
 
 
 @rt("/reports")
-def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
+def reports_page(
+    sess,
+    days: int = 30,
+    saved: str = "",
+    error: str = "",
+    studio: str = "",
+):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
@@ -5311,6 +5327,35 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
             .order_by(desc(ReportRun.created_at))
             .limit(10)
         ).all()
+        narratives = list(
+            session.scalars(
+                select(ReportNarrative)
+                .where(ReportNarrative.workspace_id == ctx.workspace.id)
+                .order_by(desc(ReportNarrative.created_at))
+                .limit(8)
+            )
+        )
+        selected_narrative = None
+        if studio:
+            try:
+                narrative_id = uuid.UUID(studio)
+            except ValueError:
+                narrative_id = None
+            if narrative_id:
+                selected_narrative = session.scalar(
+                    select(ReportNarrative).where(
+                        ReportNarrative.id == narrative_id,
+                        ReportNarrative.workspace_id == ctx.workspace.id,
+                    )
+                )
+        connectors = list(
+            session.scalars(
+                select(ReportConnector)
+                .where(ReportConnector.workspace_id == ctx.workspace.id)
+                .order_by(desc(ReportConnector.created_at))
+            )
+        )
+    connector_token = sess.pop("report_connector_token", "")
     top_rows = [
         Tr(
             Td(platform_pill(account.platform, account.display_name or account.username)),
@@ -5326,7 +5371,7 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
             Div(
                 Strong(item.name),
                 Small(
-                    f"{item.frequency.title()} · {item.report_days} days · "
+                    f"{item.frequency.title()} · {item.report_days} days · {item.output_format.upper()} · "
                     f"{', '.join(item.recipients)}"
                 ),
             ),
@@ -5364,7 +5409,11 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
         ctx,
         "Reports",
         "/reports",
-        flash("Report schedule saved." if saved else ""),
+        flash(
+            "Data connector created."
+            if saved == "connector"
+            else ("Report schedule saved." if saved else "")
+        ),
         flash(error, "error"),
         page_intro(
             "REPORTING STUDIO",
@@ -5377,6 +5426,9 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
                 A("1y", href="/reports?days=365", cls="btn small"),
                 A("Print view", href=f"/reports/print?days={days}", cls="btn"),
                 A("Export CSV", href=f"/reports/export.csv?days={days}", cls="btn primary"),
+                A("PDF", href=f"/reports/export.pdf?days={days}", cls="btn"),
+                A("PowerPoint", href=f"/reports/export.pptx?days={days}", cls="btn"),
+                A("JSON", href=f"/reports/export.json?days={days}", cls="btn"),
                 cls="report-actions",
             ),
         ),
@@ -5386,6 +5438,90 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
             stat_card("Engagements", f"{totals['engagements']:,}"),
             stat_card("Clicks", f"{totals['clicks']:,}"),
             cls="stats-grid",
+        ),
+        Div(
+            Div(
+                Div(
+                    H2("AI Report Studio"),
+                    Span("NATURAL LANGUAGE", cls="mode-badge"),
+                    cls="card-head",
+                ),
+                Form(
+                    csrf_input(sess),
+                    Textarea(
+                        "Explain what changed, identify the strongest content, and give me three practical actions for next month.",
+                        name="prompt",
+                        rows="4",
+                        required=True,
+                    ),
+                    Div(
+                        Select(
+                            Option("Last 7 days", value="7"),
+                            Option("Last 30 days", value="30", selected=True),
+                            Option("Last 90 days", value="90"),
+                            Option("Last year", value="365"),
+                            name="report_days",
+                        ),
+                        Select(
+                            Option("xAI", value="xai", selected=True),
+                            Option("OpenAI", value="openai"),
+                            name="provider",
+                        ),
+                        Button("Build report", type="submit", cls="btn primary"),
+                        cls="report-studio-controls",
+                    ),
+                    method="post",
+                    action="/reports/studio",
+                    cls="report-studio-form",
+                ),
+                Small(
+                    "Studio grounds its answer in your collected post, account, and competitor metrics. It uses the workspace BYOM profile selected in Integrations.",
+                    cls="report-delivery-note",
+                ),
+                cls="card",
+            ),
+            Div(
+                Div(
+                    H2(selected_narrative.title if selected_narrative else "Studio output"),
+                    Span(
+                        f"{selected_narrative.provider} · {selected_narrative.model_name}"
+                        if selected_narrative
+                        else "READY",
+                        cls="mode-badge",
+                    ),
+                    cls="card-head",
+                ),
+                Div(
+                    P(selected_narrative.executive_summary, cls="studio-summary"),
+                    H3("Key insights"),
+                    Ul(*(Li(item) for item in selected_narrative.insights)),
+                    H3("Recommended actions"),
+                    Ul(*(Li(item) for item in selected_narrative.recommendations)),
+                    cls="card-body studio-result",
+                )
+                if selected_narrative
+                else Div(
+                    P(
+                        "Ask a business question and Studio will turn your live metrics into an executive-ready narrative."
+                    ),
+                    cls="card-body form-help",
+                ),
+                Div(
+                    *(
+                        A(
+                            item.title,
+                            href=f"/reports?days={days}&studio={item.id}",
+                            cls="studio-history-link",
+                        )
+                        for item in narratives
+                    ),
+                    cls="studio-history",
+                )
+                if narratives
+                else "",
+                cls="card",
+            ),
+            cls="report-studio-grid",
         ),
         Div(
             Div(
@@ -5434,6 +5570,12 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
                         Option("Last year", value="365"),
                         name="report_days",
                     ),
+                    Select(
+                        Option("Interactive HTML", value="html", selected=True),
+                        Option("PDF attachment", value="pdf"),
+                        Option("Editable PowerPoint", value="pptx"),
+                        name="output_format",
+                    ),
                     Input(
                         type="email",
                         name="recipients",
@@ -5466,6 +5608,60 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
             ),
             cls="reports-layout",
         ),
+        Div(
+            Div(
+                H2("Data connectors"),
+                Span("BI + MCP", cls="mode-badge"),
+                cls="card-head",
+            ),
+            flash(
+                f"Copy this token now; it will not be shown again: {connector_token}",
+                "success",
+            )
+            if connector_token
+            else "",
+            P(
+                "Create a revocable, read-only JSON feed for Looker Studio, spreadsheets, MCP tools, or an internal dashboard.",
+                cls="card-body form-help",
+            ),
+            Div(
+                *(
+                    Div(
+                        Div(
+                            Strong(item.name),
+                            Small(
+                                f"Token …{item.token_hint} · "
+                                f"last used {_format_datetime(item.last_used_at, ctx.workspace.timezone) if item.last_used_at else 'never'}"
+                            ),
+                        ),
+                        Form(
+                            csrf_input(sess),
+                            Button("Revoke", type="submit", cls="btn small danger"),
+                            method="post",
+                            action=f"/reports/connectors/{item.id}/revoke",
+                        ),
+                        cls="report-schedule-row",
+                    )
+                    for item in connectors
+                ),
+                cls="report-schedules",
+            )
+            if connectors
+            else "",
+            Form(
+                csrf_input(sess),
+                Input(name="name", placeholder="Looker Studio feed", required=True),
+                Button("Create connector", type="submit", cls="btn primary"),
+                method="post",
+                action="/reports/connectors",
+                cls="report-connector-form",
+            ),
+            Small(
+                "Feed URL: /api/connectors/{connector_id}/report?token={token}&days=30",
+                cls="report-delivery-note",
+            ),
+            cls="card report-connectors-card",
+        ),
     )
 
 
@@ -5483,6 +5679,7 @@ async def report_schedule_add(request, sess):
         name = str(form.get("name") or "").strip()
         frequency = str(form.get("frequency") or "monthly")
         report_days = int(form.get("report_days") or 30)
+        output_format = str(form.get("output_format") or "html")
         recipients = [
             value.strip().lower()
             for value in str(form.get("recipients") or "").split(",")
@@ -5492,6 +5689,7 @@ async def report_schedule_add(request, sess):
             not name
             or frequency not in {"weekly", "monthly"}
             or report_days not in {7, 30, 90, 365}
+            or output_format not in {"html", "pdf", "pptx"}
             or not recipients
         ):
             raise ValueError("Name, frequency, and at least one recipient are required")
@@ -5506,6 +5704,7 @@ async def report_schedule_add(request, sess):
                 recipients=recipients,
                 sections=form.getlist("sections") or ["performance"],
                 report_days=report_days,
+                output_format=output_format,
                 next_run_at=next_run,
                 created_by=ctx.user.id,
             )
@@ -5515,6 +5714,131 @@ async def report_schedule_add(request, sess):
         return RedirectResponse("/reports?saved=1", status_code=303)
     except Exception as exc:  # noqa: BLE001
         return RedirectResponse(f"/reports?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/reports/studio", methods=["POST"])
+async def report_studio_generate(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        prompt = str(form.get("prompt") or "").strip()
+        provider = str(form.get("provider") or ctx.workspace.default_model_provider).lower()
+        days = int(form.get("report_days") or 30)
+        if not prompt or len(prompt) > 4000 or days not in {7, 30, 90, 365}:
+            raise ValueError("Enter a report request up to 4,000 characters and a valid period")
+        with session_scope() as session:
+            report = report_summary(session, ctx.workspace.id, days)
+            feed = report_json(ctx.workspace.name, report)
+            resolved = resolve_model(
+                session,
+                workspace_id=ctx.workspace.id,
+                user_email=ctx.user.email,
+                provider=provider,
+                purpose="text",
+            )
+        result = await invoke_json(
+            resolved,
+            system_prompt=(
+                "You are a social performance analyst. Answer only from the supplied FastSocial "
+                "metrics. Be candid about missing or sparse data. Return strict JSON with keys "
+                "title (short string), executive_summary (2-4 sentences), insights (3-6 concise "
+                "strings), and recommendations (3-6 concrete strings). Do not invent numbers."
+            ),
+            user_prompt=f"REQUEST:\n{prompt}\n\nVERIFIED METRICS:\n{json.dumps(feed)[:60000]}",
+        )
+        title = str(result.get("title") or "Performance brief")[:255]
+        summary = str(result.get("executive_summary") or "").strip()
+        insights = [str(item)[:1000] for item in result.get("insights", []) if str(item).strip()][
+            :8
+        ]
+        recommendations = [
+            str(item)[:1000] for item in result.get("recommendations", []) if str(item).strip()
+        ][:8]
+        if not summary:
+            raise RuntimeError("The model returned an empty report")
+        with session_scope() as session:
+            narrative = ReportNarrative(
+                workspace_id=ctx.workspace.id,
+                created_by=ctx.user.id,
+                prompt=prompt,
+                report_days=days,
+                title=title,
+                executive_summary=summary,
+                insights=insights,
+                recommendations=recommendations,
+                provider=resolved.provider,
+                model_name=resolved.model_name,
+            )
+            session.add(narrative)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "report.studio.generated", narrative)
+            narrative_id = narrative.id
+        return RedirectResponse(f"/reports?days={days}&studio={narrative_id}", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/reports?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/reports/connectors", methods=["POST"])
+async def report_connector_create(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    name = str(form.get("name") or "").strip()
+    if not name or len(name) > 200:
+        return RedirectResponse("/reports?error=Connector+name+is+required", status_code=303)
+    token = secrets.token_urlsafe(32)
+    with session_scope() as session:
+        connector = ReportConnector(
+            workspace_id=ctx.workspace.id,
+            name=name,
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            token_hint=token[-6:],
+            created_by=ctx.user.id,
+        )
+        session.add(connector)
+        session.flush()
+        audit(session, ctx.workspace.id, ctx.user.id, "report.connector.created", connector)
+    sess["report_connector_token"] = token
+    return RedirectResponse("/reports?saved=connector", status_code=303)
+
+
+@rt("/reports/connectors/{connector_id}/revoke", methods=["POST"])
+async def report_connector_revoke(connector_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(connector_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        connector = session.scalar(
+            select(ReportConnector).where(
+                ReportConnector.id == parsed,
+                ReportConnector.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not connector:
+            return Response("Not found", status_code=404)
+        connector.active = False
+        audit(session, ctx.workspace.id, ctx.user.id, "report.connector.revoked", connector)
+    return RedirectResponse("/reports?saved=connector", status_code=303)
 
 
 @rt("/reports/schedules/{schedule_id}/run", methods=["POST"])
@@ -5564,10 +5888,19 @@ def report_run_open(run_id: str, sess):
         if not run or not run.storage_key:
             return Response("Not found", status_code=404)
         body = media_storage().get(run.storage_key)
+    suffix = run.storage_key.rsplit(".", 1)[-1].lower()
+    media_types = {
+        "html": "text/html",
+        "pdf": "application/pdf",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
+    disposition = "inline" if suffix in {"html", "pdf"} else "attachment"
     return Response(
         body,
-        media_type="text/html",
-        headers={"Content-Disposition": f"inline; filename=fastsocial-report-{run_id}.html"},
+        media_type=media_types.get(suffix, "application/octet-stream"),
+        headers={
+            "Content-Disposition": f"{disposition}; filename=fastsocial-report-{run_id}.{suffix}"
+        },
     )
 
 
@@ -5624,6 +5957,83 @@ def reports_export(sess, days: int = 30):
         output.getvalue(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=fastsocial-brand-report.csv"},
+    )
+
+
+def _report_export_context(sess, days: int):
+    ctx = _context(sess)
+    if not ctx:
+        return None, None, None
+    days = days if days in {7, 30, 90, 365} else 30
+    with session_scope() as session:
+        report = report_summary(session, ctx.workspace.id, days)
+    return ctx, report, days
+
+
+@rt("/reports/export.pdf")
+def reports_export_pdf(sess, days: int = 30):
+    ctx, report, _days = _report_export_context(sess, days)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    body = render_report_pdf(ctx.workspace.name, report)
+    return Response(
+        body,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=fastsocial-brand-report.pdf"},
+    )
+
+
+@rt("/reports/export.pptx")
+def reports_export_pptx(sess, days: int = 30):
+    ctx, report, _days = _report_export_context(sess, days)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    body = render_report_pptx(ctx.workspace.name, report)
+    return Response(
+        body,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": "attachment; filename=fastsocial-brand-report.pptx"},
+    )
+
+
+@rt("/reports/export.json")
+def reports_export_json(sess, days: int = 30):
+    ctx, report, _days = _report_export_context(sess, days)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    return JSONResponse(
+        report_json(ctx.workspace.name, report),
+        headers={"Content-Disposition": "attachment; filename=fastsocial-brand-report.json"},
+    )
+
+
+@rt("/api/connectors/{connector_id}/report")
+def report_connector_feed(connector_id: str, token: str = "", days: int = 30):
+    try:
+        parsed = uuid.UUID(connector_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    supplied_hash = hashlib.sha256(token.encode()).hexdigest()
+    with session_scope() as session:
+        connector = session.scalar(
+            select(ReportConnector).where(
+                ReportConnector.id == parsed,
+                ReportConnector.active.is_(True),
+            )
+        )
+        if not connector or not secrets.compare_digest(connector.token_hash, supplied_hash):
+            return Response("Unauthorized", status_code=401)
+        workspace = session.get(Workspace, connector.workspace_id)
+        days = days if days in {7, 30, 90, 365} else 30
+        report = report_summary(session, connector.workspace_id, days)
+        payload = report_json(workspace.name, report)
+        connector.last_used_at = utcnow()
+    return JSONResponse(
+        payload,
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 
