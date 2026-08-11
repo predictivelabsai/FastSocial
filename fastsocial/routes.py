@@ -137,13 +137,23 @@ from fastsocial.storage import LocalStorage, media_storage
 
 
 class PageContext:
-    def __init__(self, user, workspace, membership, accounts, pending_approvals, chat_sessions):
+    def __init__(
+        self,
+        user,
+        workspace,
+        membership,
+        accounts,
+        pending_approvals,
+        chat_sessions,
+        logout_csrf,
+    ):
         self.user = user
         self.workspace = workspace
         self.membership = membership
         self.accounts = accounts
         self.pending_approvals = pending_approvals
         self.chat_sessions = chat_sessions
+        self.logout_csrf = logout_csrf
 
 
 def _context(sess: dict) -> PageContext | None:
@@ -188,7 +198,15 @@ def _context(sess: dict) -> PageContext | None:
                 .limit(12)
             )
         )
-        return PageContext(user, workspace, membership, accounts, pending, chat_sessions)
+        return PageContext(
+            user,
+            workspace,
+            membership,
+            accounts,
+            pending,
+            chat_sessions,
+            csrf_token(sess),
+        )
 
 
 def _signin_redirect():
@@ -212,6 +230,7 @@ def _app_page(ctx: PageContext, title: str, path: str, *children, action=None):
         *children,
         pending_approvals=ctx.pending_approvals,
         chat_sessions=ctx.chat_sessions,
+        logout_csrf=ctx.logout_csrf,
         action=action,
     )
 

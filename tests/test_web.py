@@ -55,6 +55,11 @@ def test_anonymous_landing_and_password_registration():
         assert "CHAT HISTORY" in dashboard.text
         assert "app.js" not in dashboard.text
         assert "chart.js" not in dashboard.text.lower()
+        logout_form = BeautifulSoup(dashboard.text, "html.parser").select_one(
+            'form[action="/auth/logout"]'
+        )
+        assert logout_form is not None
+        assert logout_form.select_one('button[type="submit"]').get_text(strip=True) == "Log out"
 
         new_post = client.get("/new-post")
         assert new_post.status_code == 200
@@ -133,6 +138,17 @@ def test_anonymous_landing_and_password_registration():
         )
         assert legacy_composer.status_code == 303
         assert legacy_composer.headers["location"] == "/new-post"
+
+        logged_out = client.post(
+            "/auth/logout",
+            data={"csrf": _csrf(dashboard)},
+            follow_redirects=False,
+        )
+        assert logged_out.status_code == 303
+        assert logged_out.headers["location"] == "/signin"
+        protected = client.get("/new-post", follow_redirects=False)
+        assert protected.status_code == 303
+        assert protected.headers["location"] == "/signin"
 
 
 def test_health_and_static_css():

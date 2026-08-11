@@ -5,8 +5,10 @@ from fasthtml.common import (
     A,
     Aside,
     Body,
+    Button,
     Details,
     Div,
+    Form,
     Head,
     Html,
     Input,
@@ -104,6 +106,7 @@ def sidebar(
     accounts: list,
     pending_approvals: int = 0,
     chat_sessions: list | None = None,
+    logout_csrf: str = "",
 ):
     items = [
         ("Dashboard", "/", "dashboard"),
@@ -220,7 +223,16 @@ def sidebar(
         Div(
             Span(initials, cls="user-avatar"),
             Div(Span(user.name or user.email.split("@", 1)[0]), Small(user.email), cls="user-copy"),
-            A("↗", href="/settings", cls="user-settings", title="Profile settings"),
+            Div(
+                A("⚙", href="/settings", cls="user-settings", title="Profile settings"),
+                Form(
+                    Input(type="hidden", name="csrf", value=logout_csrf),
+                    Button("Log out", type="submit", cls="user-logout"),
+                    method="post",
+                    action="/auth/logout",
+                ),
+                cls="user-actions",
+            ),
             cls="sidebar-user",
         ),
         cls="sidebar",
@@ -236,6 +248,7 @@ def app_page(
     *children,
     pending_approvals: int = 0,
     chat_sessions: list | None = None,
+    logout_csrf: str = "",
     action=None,
 ):
     return Html(
@@ -250,6 +263,7 @@ def app_page(
                 accounts,
                 pending_approvals,
                 chat_sessions,
+                logout_csrf,
             ),
             Main(
                 Div(
