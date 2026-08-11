@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 from bs4 import BeautifulSoup
+from sqlalchemy import func, select
 from starlette.testclient import TestClient
 
+from fastsocial.agentic import create_chat_session
 from fastsocial.app import app
+from fastsocial.db import session_scope
+from fastsocial.models import (
+    ArtifactStatus,
+    ChatSession,
+    ContentArtifact,
+    Post,
+    User,
+    WorkflowMode,
+    WorkflowStage,
+)
+from fastsocial.services import workspace_for_user
 
 
 def _csrf(response) -> str:
@@ -130,6 +143,98 @@ def test_health_and_static_css():
         stylesheet = client.get("/static/app.css")
         assert stylesheet.status_code == 200
         assert "--accent" in stylesheet.text
+
+
+def test_review_requires_explicit_approval_before_posting():
+    email = "review-gate@example.com"
+    with TestClient(app) as client:
+        registration = client.get("/register")
+        response = client.post(
+            "/register",
+            data={
+                "csrf": _csrf(registration),
+                "name": "Review Gate",
+                "email": email,
+                "password": "local-test-password",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+        with session_scope() as session:
+            user = session.scalar(select(User).where(User.email == email))
+            workspace = workspace_for_user(session, user.id)
+            workspace_id = workspace.id
+            chat = create_chat_session(
+                session,
+                workspace_id=workspace.id,
+                user_id=user.id,
+                brief="Draft a factual product update.",
+                workflow_mode=WorkflowMode.review,
+                state={"platforms": ["x"], "target_ids": []},
+            )
+            chat.stage = WorkflowStage.review
+            session.add(
+                ContentArtifact(
+                    chat_session_id=chat.id,
+                    status=ArtifactStatus.review,
+                    version=1,
+                    content={
+                        "text": "A factual product update.",
+                        "variants": {"x": "A factual product update."},
+                        "review": {"summary": "No unsupported claims.", "risks": []},
+                    },
+                    provider="xai",
+                    model_name="test-model",
+                )
+            )
+            chat_id = chat.id
+
+        review = client.get(f"/chats/{chat_id}")
+        assert review.status_code == 200
+        assert "Approve for posting" in review.text
+        assert "Publish now" not in review.text
+        blocked = client.post(
+            f"/chats/{chat_id}/post",
+            data={
+                "csrf": _csrf(review),
+                "text": "A factual product update.",
+                "variant_x": "A factual product update.",
+                "delivery": "draft",
+            },
+            follow_redirects=False,
+        )
+        assert blocked.status_code == 303
+        assert "Approve+the+current+artifact" in blocked.headers["location"]
+        approved = client.post(
+            f"/chats/{chat_id}/approve",
+            data={
+                "csrf": _csrf(review),
+                "text": "A factual product update, reviewed by a human.",
+                "variant_x": "A factual product update, reviewed by a human.",
+            },
+            follow_redirects=False,
+        )
+        assert approved.status_code == 303
+
+        with session_scope() as session:
+            artifact = session.scalar(
+                select(ContentArtifact)
+                .where(ContentArtifact.chat_session_id == chat_id)
+                .order_by(ContentArtifact.version.desc())
+            )
+            chat = session.get(ChatSession, chat_id)
+            assert artifact.status == ArtifactStatus.ready
+            assert artifact.content["text"].endswith("human.")
+            assert chat.stage == WorkflowStage.post
+            assert (
+                session.scalar(select(func.count(Post.id)).where(Post.workspace_id == workspace_id))
+                == 0
+            )
+
+        delivery = client.get(f"/chats/{chat_id}?saved=approved")
+        assert "Content approved" in delivery.text
+        assert "Publish now" in delivery.text
 
 
 def test_public_discovery_files_use_python_routes():

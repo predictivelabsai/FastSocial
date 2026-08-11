@@ -129,6 +129,7 @@ from fastsocial.services import (
     membership_for,
     publish_post,
     store_media,
+    validate_content,
     workspace_for_user,
 )
 from fastsocial.skills_service import publish_skill_version, skill_content
@@ -1144,6 +1145,7 @@ def _chat_page(
 ):
     content = dict(artifact.content) if artifact else {}
     completed = chat.stage == WorkflowStage.complete
+    awaiting_approval = bool(artifact and artifact.status == ArtifactStatus.review)
     variants = content.get("variants") if isinstance(content.get("variants"), dict) else {}
     state = dict(chat.state or {})
     media_ids = [uuid.UUID(item) for item in state.get("generated_media_ids", [])]
@@ -1250,29 +1252,40 @@ def _chat_page(
                         ),
                         cls="field",
                     )
-                    if not completed
+                    if not completed and not awaiting_approval
                     else ""
                 ),
                 (
                     Div(
-                        Button(
-                            "Save draft", type="submit", name="delivery", value="draft", cls="btn"
-                        ),
-                        Button(
-                            "Schedule",
-                            type="submit",
-                            name="delivery",
-                            value="schedule",
-                            cls="btn",
-                            disabled=True if not state.get("target_ids") else None,
-                        ),
-                        Button(
-                            "Publish now",
-                            type="submit",
-                            name="delivery",
-                            value="now",
-                            cls="btn primary",
-                            disabled=True if not state.get("target_ids") else None,
+                        (
+                            Button("Approve for posting →", type="submit", cls="btn primary")
+                            if awaiting_approval
+                            else Div(
+                                Button(
+                                    "Save draft",
+                                    type="submit",
+                                    name="delivery",
+                                    value="draft",
+                                    cls="btn",
+                                ),
+                                Button(
+                                    "Schedule",
+                                    type="submit",
+                                    name="delivery",
+                                    value="schedule",
+                                    cls="btn",
+                                    disabled=True if not state.get("target_ids") else None,
+                                ),
+                                Button(
+                                    "Publish now",
+                                    type="submit",
+                                    name="delivery",
+                                    value="now",
+                                    cls="btn primary",
+                                    disabled=True if not state.get("target_ids") else None,
+                                ),
+                                cls="form-actions",
+                            )
                         ),
                         cls="form-actions",
                     )
@@ -1283,7 +1296,9 @@ def _chat_page(
                     )
                 ),
                 method="post",
-                action=f"/chats/{chat.id}/post",
+                action=(
+                    f"/chats/{chat.id}/approve" if awaiting_approval else f"/chats/{chat.id}/post"
+                ),
             ),
             Div(
                 Form(
@@ -1350,6 +1365,7 @@ def chat_detail(chat_id: str, sess, saved: str = "", error: str = ""):
     if not chat:
         return Response("Not found", status_code=404)
     saved_message = {
+        "approved": "Content approved. Choose how to save or deliver it when you are ready.",
         "posted": "Post delivered to the publishing pipeline.",
         "media": "Generated media saved to the library.",
     }.get(saved, "")
@@ -1422,6 +1438,8 @@ async def _deliver_chat(chat_id: uuid.UUID, ctx: PageContext, *, delivery: str, 
             raise ValueError("Post artifact not found")
         if chat.post_id:
             return chat.post_id
+        if artifact.status != ArtifactStatus.ready:
+            raise ValueError("Approve the current artifact before posting")
         content = dict(artifact.content)
         if form is not None:
             content["text"] = str(form.get("text") or "").strip()
@@ -1485,6 +1503,63 @@ async def _deliver_chat(chat_id: uuid.UUID, ctx: PageContext, *, delivery: str, 
         chat = session.get(ChatSession, chat_id)
         chat.stage = WorkflowStage.complete
     return post_id
+
+
+def _content_from_review_form(artifact: ContentArtifact, form) -> dict:
+    content = dict(artifact.content)
+    content["text"] = str(form.get("text") or "").strip()
+    variants = dict(content.get("variants") or {})
+    for platform in list(variants):
+        variants[platform] = str(form.get(f"variant_{platform}") or "").strip()
+    content["variants"] = variants
+    return content
+
+
+@rt("/chats/{chat_id}/approve", methods=["POST"])
+async def chat_approve(chat_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    chat, _messages, _events, artifact = _chat_records(ctx, chat_id)
+    if not chat or not artifact:
+        return Response("Not found", status_code=404)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        with session_scope() as session:
+            row = session.get(ChatSession, chat.id)
+            current = latest_artifact(session, chat.id)
+            if not current or current.status != ArtifactStatus.review:
+                raise ValueError("This artifact is not awaiting approval")
+            content = _content_from_review_form(current, form)
+            state = dict(row.state or {})
+            platforms = [str(item) for item in state.get("platforms", [])]
+            errors = {}
+            for platform in platforms:
+                errors.update(
+                    validate_content(
+                        str((content.get("variants") or {}).get(platform) or content["text"]),
+                        [platform],
+                    )
+                )
+            if errors:
+                raise ValueError("; ".join(errors.values()))
+            current.content = content
+            current.status = ArtifactStatus.ready
+            row.stage = WorkflowStage.post
+            row.status = "active"
+            record_event(
+                session,
+                row.id,
+                "review",
+                "approved",
+                "Content approved for posting",
+                artifact_version=current.version,
+            )
+        return RedirectResponse(f"/chats/{chat.id}?saved=approved", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/chats/{chat.id}?error={quote_plus(str(exc))}", status_code=303)
 
 
 @rt("/chats/{chat_id}/post", methods=["POST"])
