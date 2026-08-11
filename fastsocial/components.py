@@ -45,6 +45,7 @@ ICONS = {
     "inbox": "✉",
     "reports": "▤",
     "smartlinks": "↗",
+    "brands": "◆",
     "approvals": "✓",
     "integrations": "⇄",
     "team": "♙",
@@ -138,6 +139,7 @@ def sidebar(
     current_path: str,
     user,
     workspace,
+    workspaces: list,
     accounts: list,
     pending_approvals: int = 0,
     chat_sessions: list | None = None,
@@ -173,13 +175,21 @@ def sidebar(
     }
     integration_links = [
         A(
-            Span(PLATFORM_MARKS[platform], cls=f"platform-mark {platform}"),
-            Span(name),
-            Span(str(counts[platform]), cls="nav-count"),
-            href=f"/integrations#{platform}",
+            Span(ICONS["integrations"], cls="nav-icon"),
+            Span("Overview"),
+            href="/integrations",
             cls="nav-sublink",
-        )
-        for platform, name in PLATFORM_NAMES.items()
+        ),
+        *[
+            A(
+                Span(PLATFORM_MARKS[platform], cls=f"platform-mark {platform}"),
+                Span(name),
+                Span(str(counts[platform]), cls="nav-count"),
+                href=f"/integrations#{platform}",
+                cls="nav-sublink",
+            )
+            for platform, name in PLATFORM_NAMES.items()
+        ],
     ]
     integrations = Details(
         Summary(
@@ -192,6 +202,13 @@ def sidebar(
         cls=f"nav-details{' active' if current_path.startswith('/integrations') else ''}",
     )
     lower = [
+        A(
+            Span(ICONS["brands"], cls="nav-icon"),
+            Span("Brands"),
+            Span(str(len(workspaces)), cls="nav-count"),
+            href="/brands",
+            cls=f"nav-link{' active' if current_path.startswith('/brands') else ''}",
+        ),
         A(
             Span(ICONS["skills"], cls="nav-icon"),
             Span("Skills"),
@@ -227,9 +244,36 @@ def sidebar(
         ),
         Div(
             Span("WORKSPACE", cls="eyebrow"),
-            Div(
-                Span(workspace.name[:1].upper(), cls="workspace-avatar"),
-                Div(Span(workspace.name), Small("Personal workspace")),
+            Details(
+                Summary(
+                    Span(workspace.name[:1].upper(), cls="workspace-avatar"),
+                    Div(
+                        Span(workspace.name),
+                        Small("Personal workspace" if len(workspaces) == 1 else "Active brand"),
+                    ),
+                ),
+                Div(
+                    *[
+                        Form(
+                            Input(type="hidden", name="csrf", value=logout_csrf),
+                            Input(type="hidden", name="next", value=current_path),
+                            Button(
+                                Span(item.name[:1].upper(), cls="workspace-option-avatar"),
+                                Span(item.name),
+                                Span("✓", cls="workspace-option-check")
+                                if item.id == workspace.id
+                                else "",
+                                type="submit",
+                                cls="workspace-option",
+                            ),
+                            method="post",
+                            action=f"/brands/{item.id}/switch",
+                        )
+                        for item in workspaces
+                    ],
+                    A("Manage brands", href="/brands", cls="workspace-manage-link"),
+                    cls="workspace-menu",
+                ),
                 cls="workspace-switcher",
             ),
             cls="workspace-block",
@@ -290,6 +334,7 @@ def app_page(
     workspace,
     accounts: list,
     *children,
+    workspaces: list | None = None,
     pending_approvals: int = 0,
     chat_sessions: list | None = None,
     logout_csrf: str = "",
@@ -304,6 +349,7 @@ def app_page(
                 current_path,
                 user,
                 workspace,
+                workspaces or [workspace],
                 accounts,
                 pending_approvals,
                 chat_sessions,

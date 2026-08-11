@@ -15,6 +15,7 @@ from fastsocial.models import (
     AdCampaignDaily,
     CollectionRun,
     CompetitorMetricDaily,
+    CompetitorPost,
     CompetitorProfile,
     ConnectionProvider,
     InboxConversation,
@@ -71,6 +72,21 @@ class FakeCollector:
                 engagement=700,
                 reach=15000,
                 engagement_rate=4.6,
+                raw={
+                    "recent_posts": [
+                        {
+                            "post_id": "rival-post-1",
+                            "published_at": "2026-08-10T09:00:00Z",
+                            "type": "reel",
+                            "caption": "A high-performing competitor reel",
+                            "url": "https://example.com/rival-post-1",
+                            "reach": 12000,
+                            "likes": 450,
+                            "comments": 30,
+                            "shares": 20,
+                        }
+                    ]
+                },
             )
         ]
 
@@ -156,7 +172,7 @@ def test_live_collectors_upsert_all_operational_surfaces(monkeypatch):
         fake = FakeCollector()
         monkeypatch.setattr(services, "client_for", lambda account: fake)
         result = asyncio.run(collect_live_data(workspace_id))
-        assert result == {"inbox": 1, "ads": 1, "competitors": 1, "listening": 1}
+        assert result == {"inbox": 1, "ads": 1, "competitors": 2, "listening": 1}
 
         with session_scope() as session:
             conversation = session.scalar(
@@ -176,6 +192,11 @@ def test_live_collectors_upsert_all_operational_surfaces(monkeypatch):
                 .join(CompetitorProfile)
                 .where(CompetitorProfile.workspace_id == workspace_id)
             )
+            competitor_post = session.scalar(
+                select(CompetitorPost)
+                .join(CompetitorProfile)
+                .where(CompetitorProfile.workspace_id == workspace_id)
+            )
             mention = session.scalar(
                 select(ListeningMention)
                 .join(ListeningQuery)
@@ -189,6 +210,8 @@ def test_live_collectors_upsert_all_operational_surfaces(monkeypatch):
             assert message.body == "A collected customer question"
             assert ad.revenue == 200
             assert competitor.followers == 9000
+            assert competitor_post.content_type == "reel"
+            assert competitor_post.engagement == 500
             assert mention.sentiment == "positive"
             assert {run.collector_kind for run in runs} == {
                 "inbox",
@@ -201,7 +224,7 @@ def test_live_collectors_upsert_all_operational_surfaces(monkeypatch):
         integrations = client.get("/integrations")
         assert "Instagram" in integrations.text
         assert "Collection activity" in integrations.text
-        assert "1/1 records" in integrations.text
+        assert "2/2 records" in integrations.text
         assert "Brand mentions" in client.get("/listening").text
 
         websites = client.get("/websites")

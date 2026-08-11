@@ -14,6 +14,69 @@ class PublishResult:
 
 
 @dataclass
+class AudienceSegment:
+    dimension: str
+    segment: str
+    value: int = 0
+    percentage: float = 0
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+def audience_segments_from_payload(payload: dict[str, Any]) -> list[AudienceSegment]:
+    """Normalize common provider demographic envelopes without discarding their raw shape."""
+    source = payload.get("audience") or payload.get("demographics") or []
+    records: list[dict[str, Any]] = []
+    if isinstance(source, list):
+        records = [item for item in source if isinstance(item, dict)]
+    elif isinstance(source, dict):
+        for dimension, values in source.items():
+            if isinstance(values, dict):
+                records.extend(
+                    {
+                        "dimension": dimension,
+                        "segment": segment,
+                        "value": value,
+                    }
+                    for segment, value in values.items()
+                )
+            elif isinstance(values, list):
+                records.extend(
+                    {**item, "dimension": item.get("dimension") or dimension}
+                    for item in values
+                    if isinstance(item, dict)
+                )
+
+    normalized: list[AudienceSegment] = []
+    for item in records:
+        dimension = str(item.get("dimension") or item.get("type") or "").strip().lower()
+        segment = str(
+            item.get("segment") or item.get("label") or item.get("name") or item.get("key") or ""
+        ).strip()
+        if not dimension or not segment:
+            continue
+        raw_value = item.get("value", item.get("count", 0))
+        raw_percentage = item.get("percentage", item.get("percent", item.get("share", 0)))
+        try:
+            value = max(0, int(float(raw_value or 0)))
+        except (TypeError, ValueError):
+            value = 0
+        try:
+            percentage = max(0, float(raw_percentage or 0))
+        except (TypeError, ValueError):
+            percentage = 0
+        normalized.append(
+            AudienceSegment(
+                dimension=dimension[:60],
+                segment=segment[:255],
+                value=value,
+                percentage=percentage,
+                raw=item,
+            )
+        )
+    return normalized
+
+
+@dataclass
 class NormalizedMetrics:
     impressions: int = 0
     reach: int = 0
@@ -24,6 +87,7 @@ class NormalizedMetrics:
     saves: int = 0
     followers: int = 0
     engagement: int = 0
+    audience: list[AudienceSegment] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 

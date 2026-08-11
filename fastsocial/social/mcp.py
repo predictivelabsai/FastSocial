@@ -16,6 +16,7 @@ from fastsocial.social.base import (
     NormalizedMetrics,
     PublishResult,
     SocialAPIError,
+    audience_segments_from_payload,
 )
 
 
@@ -180,6 +181,7 @@ class ManagedMCPClient:
             impressions=int(body.get("impressions", 0) or 0),
             engagement=int(body.get("engagement", 0) or 0),
             reach=int(body.get("reach", 0) or 0),
+            audience=audience_segments_from_payload(body),
             raw=body,
         )
 

@@ -28,6 +28,7 @@ from fasthtml.common import (
     Div,
     Form,
     Html,
+    Img,
     Input,
     Label,
     Li,
@@ -50,6 +51,7 @@ from fasthtml.common import (
     Thead,
     Tr,
     Ul,
+    Video,
 )
 from fasthtml.xtend import sse_message
 from sqlalchemy import desc, func, select, update
@@ -57,6 +59,7 @@ from sqlalchemy.orm import selectinload
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
+from fastsocial import __version__
 from fastsocial.agentic import (
     create_chat_session,
     generate_chat_artifact,
@@ -96,13 +99,16 @@ from fastsocial.models import (
     AIProviderCredential,
     ApprovalStatus,
     ArtifactStatus,
+    AudienceMetricDaily,
     AuditLog,
     AutolistItem,
+    AutomationToken,
     ChatMessage,
     ChatRole,
     ChatSession,
     CollectionRun,
     CompetitorMetricDaily,
+    CompetitorPost,
     CompetitorProfile,
     ConnectionProvider,
     ContentArtifact,
@@ -129,6 +135,7 @@ from fastsocial.models import (
     SavedReply,
     SkillDefinition,
     SkillVersionStatus,
+    SmartLinkEvent,
     SmartLinkItem,
     SmartLinkPage,
     SocialAccount,
@@ -165,12 +172,14 @@ from fastsocial.services import (
     collect_live_data,
     collect_provider_listening,
     create_post,
+    create_workspace,
     get_or_create_user,
     membership_for,
     moderate_inbox_conversation,
     next_autolist_run,
     process_due_autolists,
     publish_post,
+    repurpose_post_to_workspaces,
     send_inbox_reply,
     slugify,
     store_media,
@@ -191,6 +200,7 @@ class PageContext:
         self,
         user,
         workspace,
+        workspaces,
         membership,
         accounts,
         pending_approvals,
@@ -199,6 +209,7 @@ class PageContext:
     ):
         self.user = user
         self.workspace = workspace
+        self.workspaces = workspaces
         self.membership = membership
         self.accounts = accounts
         self.pending_approvals = pending_approvals
@@ -224,6 +235,14 @@ def _context(sess: dict) -> PageContext | None:
         if not workspace:
             return None
         sess["workspace_id"] = str(workspace.id)
+        workspaces = list(
+            session.scalars(
+                select(Workspace)
+                .join(WorkspaceMember)
+                .where(WorkspaceMember.user_id == user.id)
+                .order_by(Workspace.created_at, Workspace.name)
+            )
+        )
         membership = membership_for(session, workspace.id, user.id)
         accounts = list(
             session.scalars(
@@ -251,6 +270,7 @@ def _context(sess: dict) -> PageContext | None:
         return PageContext(
             user,
             workspace,
+            workspaces,
             membership,
             accounts,
             pending,
@@ -278,6 +298,7 @@ def _app_page(ctx: PageContext, title: str, path: str, *children, action=None):
         ctx.workspace,
         ctx.accounts,
         *children,
+        workspaces=ctx.workspaces,
         pending_approvals=ctx.pending_approvals,
         chat_sessions=ctx.chat_sessions,
         logout_csrf=ctx.logout_csrf,
@@ -300,6 +321,33 @@ def _format_datetime(value: datetime | None, timezone_name: str) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(ZoneInfo(timezone_name)).strftime("%d %b %Y · %H:%M")
+
+
+def _workspace_return_path(value: str) -> str:
+    allowed = {
+        "/",
+        "/new-post",
+        "/calendar",
+        "/autolists",
+        "/posts",
+        "/library",
+        "/media",
+        "/analytics",
+        "/listening",
+        "/websites",
+        "/ads",
+        "/competitors",
+        "/inbox",
+        "/reports",
+        "/smartlinks",
+        "/integrations",
+        "/brands",
+        "/skills",
+        "/approvals",
+        "/team",
+        "/settings",
+    }
+    return value if value in allowed else "/"
 
 
 def _landing():
@@ -2587,8 +2635,41 @@ async def post_save_template(post_id: str, request, sess):
     return RedirectResponse(f"/posts/{post_id}?saved=template", status_code=303)
 
 
+@rt("/posts/{post_id}/repurpose", methods=["POST"])
+async def post_repurpose(post_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(post_id)
+        destination_ids = [uuid.UUID(value) for value in form.getlist("destination_ids")]
+        with session_scope() as session:
+            source = session.scalar(
+                select(Post).where(Post.id == parsed, Post.workspace_id == ctx.workspace.id)
+            )
+            if not source:
+                return Response("Not found", status_code=404)
+            created = repurpose_post_to_workspaces(
+                session,
+                source_post_id=source.id,
+                destination_workspace_ids=destination_ids,
+                user_id=ctx.user.id,
+                include_media=form.get("include_media") == "on",
+            )
+        return RedirectResponse(
+            f"/posts/{post_id}?saved=repurposed&count={len(created)}", status_code=303
+        )
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/posts/{post_id}?error={quote_plus(str(exc))}", status_code=303)
+
+
 @rt("/posts/{post_id}")
-def post_detail(post_id: str, sess, saved: str = ""):
+def post_detail(post_id: str, sess, saved: str = "", count: int = 0, error: str = ""):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
@@ -2616,6 +2697,20 @@ def post_detail(post_id: str, sess, saved: str = ""):
                     AuditLog.entity_id == str(post.id),
                 )
                 .order_by(desc(AuditLog.created_at))
+            )
+        )
+        repurpose_destinations = list(
+            session.scalars(
+                select(Workspace)
+                .join(WorkspaceMember, WorkspaceMember.workspace_id == Workspace.id)
+                .where(
+                    WorkspaceMember.user_id == ctx.user.id,
+                    WorkspaceMember.role.in_(
+                        [WorkspaceRole.owner, WorkspaceRole.admin, WorkspaceRole.editor]
+                    ),
+                    Workspace.id != ctx.workspace.id,
+                )
+                .order_by(Workspace.name)
             )
         )
     target_rows = [
@@ -2679,13 +2774,57 @@ def post_detail(post_id: str, sess, saved: str = ""):
             ),
             cls="form-actions",
         )
+    repurpose_controls = ""
+    if repurpose_destinations and ctx.membership.role != WorkspaceRole.viewer:
+        repurpose_controls = Details(
+            Summary("Repurpose across brands"),
+            Form(
+                csrf_input(sess),
+                Div(
+                    *[
+                        Label(
+                            Input(
+                                type="checkbox",
+                                name="destination_ids",
+                                value=str(workspace.id),
+                            ),
+                            Span(workspace.name[:1].upper(), cls="workspace-option-avatar"),
+                            workspace.name,
+                            cls="account-option",
+                        )
+                        for workspace in repurpose_destinations
+                    ],
+                    cls="account-options",
+                ),
+                Label(
+                    Input(type="checkbox", name="include_media", checked=True),
+                    " Copy attached media into each destination brand",
+                    cls="account-option",
+                ),
+                Small(
+                    "Copies are created as drafts without publishing targets, ready for brand-specific edits."
+                ),
+                Button("Create brand drafts", type="submit", cls="btn primary"),
+                method="post",
+                action=f"/posts/{post.id}/repurpose",
+                cls="repurpose-form",
+            ),
+            cls="card repurpose-card",
+        )
     return _app_page(
         ctx,
         "Post details",
         f"/posts/{post_id}",
         flash(
-            "Saved to Post Library." if saved == "template" else ("Post saved." if saved else "")
+            "Saved to Post Library."
+            if saved == "template"
+            else f"Created {count} brand draft{'s' if count != 1 else ''}."
+            if saved == "repurposed"
+            else "Post saved."
+            if saved
+            else ""
         ),
+        flash(error, "error"),
         page_intro(
             "POST",
             (post.content.get("text", "") or "Untitled post")[:80],
@@ -2720,6 +2859,7 @@ def post_detail(post_id: str, sess, saved: str = ""):
             ),
             cls="card",
         ),
+        repurpose_controls,
         Br(),
         Div(
             Div(H2("Publishing targets"), cls="card-head"),
@@ -3950,6 +4090,14 @@ def integrations_page(sess, saved: str = "", error: str = ""):
                 .order_by(MediaSourceConnection.source_provider, MediaSourceConnection.name)
             )
         )
+        automation_tokens = list(
+            session.scalars(
+                select(AutomationToken)
+                .where(AutomationToken.workspace_id == ctx.workspace.id)
+                .order_by(desc(AutomationToken.created_at))
+            )
+        )
+    revealed_automation_token = str(sess.pop("automation_token", ""))
     collection_rows = [
         Div(
             Div(
@@ -4097,6 +4245,85 @@ def integrations_page(sess, saved: str = "", error: str = ""):
         ),
         Div(
             Div(
+                Div(
+                    Span("AUTOMATION", cls="eyebrow accent"),
+                    H2("API, MCP, Zapier, and Make"),
+                    P(
+                        "Create scoped workspace tokens for your own agents and automation tools. Tokens are shown once; the database stores only their hashes."
+                    ),
+                ),
+                Span("BYOA", cls="mode-badge"),
+                cls="card-head",
+                id="automation",
+            ),
+            Div(
+                Strong("Copy this token now"),
+                P(revealed_automation_token, cls="mono automation-token-value"),
+                Small("It cannot be displayed again."),
+                cls="automation-token-reveal",
+            )
+            if revealed_automation_token
+            else "",
+            Div(
+                *[
+                    Div(
+                        Div(
+                            Strong(token.name),
+                            Small(
+                                f"••••{token.token_hint} · {', '.join(token.scopes)} · "
+                                f"last used {_format_datetime(token.last_used_at, ctx.workspace.timezone)}"
+                            ),
+                        ),
+                        Div(
+                            Span("ACTIVE" if token.active else "REVOKED", cls="mode-badge"),
+                            Form(
+                                csrf_input(sess),
+                                Button("Revoke", type="submit", cls="btn danger small"),
+                                method="post",
+                                action=f"/integrations/automation/{token.id}/revoke",
+                            )
+                            if token.active
+                            else "",
+                        ),
+                        cls="report-schedule-row",
+                    )
+                    for token in automation_tokens
+                ],
+                cls="report-schedules",
+            ),
+            Form(
+                csrf_input(sess),
+                Input(name="name", placeholder="Zapier production", required=True),
+                Div(
+                    *[
+                        Label(
+                            Input(type="checkbox", name="scopes", value=scope, checked=True),
+                            f" {label}",
+                        )
+                        for scope, label in (
+                            ("posts:read", "Read posts"),
+                            ("posts:write", "Create and schedule"),
+                            ("analytics:read", "Read analytics"),
+                        )
+                    ],
+                    cls="choice-grid automation-scopes",
+                ),
+                Button("Create token", type="submit", cls="btn primary"),
+                method="post",
+                action="/integrations/automation",
+                cls="automation-token-form",
+            )
+            if ctx.membership.role in {WorkspaceRole.owner, WorkspaceRole.admin}
+            else "",
+            Div(
+                P(f"REST base: {settings().service_url}/api/v1"),
+                P(f"MCP endpoint: {settings().service_url}/mcp"),
+                cls="card-body form-help mono",
+            ),
+            cls="card integration-automation",
+        ),
+        Div(
+            Div(
                 H2("Collection activity"),
                 Small("Inbox every 10 minutes · Ads and competitors hourly"),
                 cls="card-head",
@@ -4107,6 +4334,343 @@ def integrations_page(sess, saved: str = "", error: str = ""):
             cls="card",
         ),
     )
+
+
+AUTOMATION_SCOPES = {"posts:read", "posts:write", "analytics:read"}
+
+
+@rt("/integrations/automation", methods=["POST"])
+async def automation_token_create(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    name = str(form.get("name") or "").strip()
+    scopes = sorted(set(form.getlist("scopes")) & AUTOMATION_SCOPES)
+    if not name or not scopes:
+        return RedirectResponse(
+            "/integrations?error=Enter+a+token+name+and+choose+at+least+one+scope#automation",
+            status_code=303,
+        )
+    token = f"fs_{secrets.token_urlsafe(36)}"
+    with session_scope() as session:
+        row = AutomationToken(
+            workspace_id=ctx.workspace.id,
+            name=name[:200],
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            token_hint=token[-6:],
+            scopes=scopes,
+            created_by=ctx.user.id,
+        )
+        session.add(row)
+        session.flush()
+        audit(session, ctx.workspace.id, ctx.user.id, "automation.token.created", row)
+    sess["automation_token"] = token
+    return RedirectResponse("/integrations?saved=automation#automation", status_code=303)
+
+
+@rt("/integrations/automation/{token_id}/revoke", methods=["POST"])
+async def automation_token_revoke(token_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(token_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        row = session.scalar(
+            select(AutomationToken).where(
+                AutomationToken.id == parsed,
+                AutomationToken.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not row:
+            return Response("Not found", status_code=404)
+        row.active = False
+        audit(session, ctx.workspace.id, ctx.user.id, "automation.token.revoked", row)
+    return RedirectResponse("/integrations?saved=automation#automation", status_code=303)
+
+
+def _automation_identity(request, required_scope: str = ""):
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None
+    supplied = authorization.split(" ", 1)[1].strip()
+    if not supplied:
+        return None
+    supplied_hash = hashlib.sha256(supplied.encode()).hexdigest()
+    with session_scope() as session:
+        token = session.scalar(
+            select(AutomationToken).where(
+                AutomationToken.token_hash == supplied_hash,
+                AutomationToken.active.is_(True),
+            )
+        )
+        if not token or (required_scope and required_scope not in token.scopes):
+            return None
+        workspace = session.get(Workspace, token.workspace_id)
+        token.last_used_at = utcnow()
+        return {
+            "token_id": token.id,
+            "workspace_id": token.workspace_id,
+            "user_id": token.created_by,
+            "scopes": set(token.scopes),
+            "workspace_name": workspace.name,
+            "timezone": workspace.timezone,
+        }
+
+
+def _automation_posts(identity: dict, limit: int = 50) -> list[dict]:
+    with session_scope() as session:
+        posts = list(
+            session.scalars(
+                select(Post)
+                .where(Post.workspace_id == identity["workspace_id"])
+                .options(selectinload(Post.targets))
+                .order_by(desc(Post.created_at))
+                .limit(max(1, min(limit, 100)))
+            )
+        )
+        return [
+            {
+                "id": str(post.id),
+                "status": post.status.value,
+                "text": str((post.content or {}).get("text") or ""),
+                "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else None,
+                "published_at": post.published_at.isoformat() if post.published_at else None,
+                "target_ids": [str(target.social_account_id) for target in post.targets],
+            }
+            for post in posts
+        ]
+
+
+def _automation_create_post(identity: dict, arguments: dict, *, schedule: bool) -> dict:
+    text = str(arguments.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required")
+    try:
+        target_ids = [uuid.UUID(str(item)) for item in arguments.get("target_ids", [])]
+        media_ids = [uuid.UUID(str(item)) for item in arguments.get("media_ids", [])]
+    except ValueError as exc:
+        raise ValueError("target_ids and media_ids must contain UUIDs") from exc
+    scheduled_at = None
+    if schedule:
+        if not target_ids:
+            raise ValueError("target_ids are required when scheduling")
+        value = str(arguments.get("scheduled_at") or "").strip()
+        if not value:
+            raise ValueError("scheduled_at is required")
+        scheduled_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if not scheduled_at.tzinfo:
+            scheduled_at = scheduled_at.replace(tzinfo=ZoneInfo(identity["timezone"]))
+        scheduled_at = scheduled_at.astimezone(UTC)
+    with session_scope() as session:
+        workspace = session.get(Workspace, identity["workspace_id"])
+        post = create_post(
+            session,
+            workspace=workspace,
+            user_id=identity["user_id"],
+            text=text,
+            target_ids=target_ids,
+            media_ids=media_ids,
+            scheduled_at=scheduled_at,
+            save_draft=not schedule,
+            platform_text=arguments.get("platform_text")
+            if isinstance(arguments.get("platform_text"), dict)
+            else {},
+        )
+        return {"id": str(post.id), "status": post.status.value}
+
+
+@rt("/api/v1/posts", methods=["GET"])
+def automation_posts_list(request, limit: int = 50):
+    identity = _automation_identity(request, "posts:read")
+    if not identity:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return JSONResponse({"posts": _automation_posts(identity, limit)})
+
+
+@rt("/api/v1/posts", methods=["POST"])
+async def automation_posts_create(request):
+    identity = _automation_identity(request, "posts:write")
+    if not identity:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("JSON object required")
+        result = _automation_create_post(
+            identity,
+            body,
+            schedule=str(body.get("mode") or "draft").lower() == "schedule",
+        )
+        return JSONResponse(result, status_code=201)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@rt("/api/v1/analytics", methods=["GET"])
+def automation_analytics(request, days: int = 30):
+    identity = _automation_identity(request, "analytics:read")
+    if not identity:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    days = days if days in {7, 30, 90, 365} else 30
+    with session_scope() as session:
+        report = report_summary(session, identity["workspace_id"], days)
+    return JSONResponse(report_json(identity["workspace_name"], report))
+
+
+def _mcp_tools() -> list[dict]:
+    return [
+        {
+            "name": "list_posts",
+            "description": "List recent FastSocial posts in this workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+            },
+        },
+        {
+            "name": "create_draft",
+            "description": "Create an editable social post draft.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "target_ids": {"type": "array", "items": {"type": "string"}},
+                    "media_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["text"],
+            },
+        },
+        {
+            "name": "schedule_post",
+            "description": "Create and schedule a post for connected account IDs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "target_ids": {"type": "array", "items": {"type": "string"}},
+                    "media_ids": {"type": "array", "items": {"type": "string"}},
+                    "scheduled_at": {"type": "string"},
+                },
+                "required": ["text", "target_ids", "scheduled_at"],
+            },
+        },
+        {
+            "name": "analytics_summary",
+            "description": "Read the normalized workspace performance summary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"days": {"type": "integer", "enum": [7, 30, 90, 365]}},
+            },
+        },
+    ]
+
+
+@rt("/mcp", methods=["POST"])
+async def automation_mcp(request):
+    identity = _automation_identity(request)
+    if not identity:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = {}
+    try:
+        body = await request.json()
+        request_id = body.get("id")
+        method = str(body.get("method") or "")
+        protocol_version = request.headers.get("mcp-protocol-version", "")
+        if protocol_version == "2026-07-28":
+            if request.headers.get("mcp-method", "") != method:
+                raise ValueError("Mcp-Method header does not match the JSON-RPC method")
+            if method == "tools/call":
+                params = body.get("params") if isinstance(body.get("params"), dict) else {}
+                if request.headers.get("mcp-name", "") != str(params.get("name") or ""):
+                    raise ValueError("Mcp-Name header does not match the tool name")
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "FastSocial", "version": __version__},
+            }
+        elif method == "server/discover":
+            result = {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "FastSocial", "version": __version__},
+            }
+        elif method == "notifications/initialized":
+            return Response(status_code=202)
+        elif method == "tools/list":
+            result = {
+                "tools": _mcp_tools(),
+                "ttlMs": 300000,
+                "cacheScope": "private",
+            }
+        elif method == "tools/call":
+            params = body.get("params") if isinstance(body.get("params"), dict) else {}
+            name = str(params.get("name") or "")
+            arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            required_scope = (
+                "posts:read"
+                if name == "list_posts"
+                else "analytics:read"
+                if name == "analytics_summary"
+                else "posts:write"
+            )
+            if required_scope not in identity["scopes"]:
+                raise PermissionError(f"token lacks {required_scope}")
+            if name == "list_posts":
+                structured = {"posts": _automation_posts(identity, int(arguments.get("limit", 50)))}
+            elif name == "create_draft":
+                structured = _automation_create_post(identity, arguments, schedule=False)
+            elif name == "schedule_post":
+                structured = _automation_create_post(identity, arguments, schedule=True)
+            elif name == "analytics_summary":
+                days = int(arguments.get("days", 30))
+                days = days if days in {7, 30, 90, 365} else 30
+                with session_scope() as session:
+                    report = report_summary(session, identity["workspace_id"], days)
+                structured = report_json(identity["workspace_name"], report)
+            else:
+                raise ValueError("unknown tool")
+            result = {
+                "content": [{"type": "text", "text": json.dumps(structured)}],
+                "structuredContent": structured,
+            }
+        else:
+            raise ValueError("method not found")
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id, "result": result},
+            headers={"MCP-Protocol-Version": "2026-07-28"},
+        )
+    except PermissionError as exc:
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": body.get("id") if isinstance(body, dict) else None,
+                "error": {"code": -32001, "message": str(exc)},
+            },
+            status_code=403,
+        )
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": body.get("id") if isinstance(body, dict) else None,
+                "error": {"code": -32602, "message": str(exc)},
+            },
+            status_code=400,
+        )
 
 
 @rt("/integrations/media-sources", methods=["POST"])
@@ -5185,13 +5749,44 @@ def _analytics_svg(data: dict) -> str:
     )
 
 
+def _analytics_content_type(metric: PostMetric, post: Post) -> str:
+    raw_type = str(
+        (metric.raw or {}).get("content_type")
+        or (metric.raw or {}).get("media_type")
+        or (post.content or {}).get("post_type")
+        or (post.content or {}).get("content_type")
+        or "post"
+    ).lower()
+    aliases = {
+        "short": "reel",
+        "short_video": "reel",
+        "short-form video": "reel",
+        "carousel_album": "carousel",
+        "photo": "image",
+    }
+    normalized = aliases.get(raw_type, raw_type)
+    return (
+        normalized
+        if normalized in {"post", "image", "carousel", "video", "reel", "story"}
+        else "post"
+    )
+
+
 @rt("/analytics")
-def analytics_page(sess):
+def analytics_page(sess, days: int = 30, platform: str = "all", content_type: str = "all"):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
+    days = days if days in {7, 30, 90, 365} else 30
+    platform = platform if platform in PLATFORM_NAMES else "all"
+    content_type = (
+        content_type
+        if content_type in {"post", "image", "carousel", "video", "reel", "story"}
+        else "all"
+    )
+    since = utcnow() - timedelta(days=days)
     with session_scope() as session:
-        rows = session.execute(
+        chart_query = (
             select(
                 func.date(PostMetric.collected_at).label("day"),
                 func.sum(PostMetric.impressions).label("impressions"),
@@ -5201,24 +5796,104 @@ def analytics_page(sess):
             )
             .join(PostTarget, PostMetric.post_target_id == PostTarget.id)
             .join(Post, PostTarget.post_id == Post.id)
-            .where(Post.workspace_id == ctx.workspace.id)
+            .join(SocialAccount, PostTarget.social_account_id == SocialAccount.id)
+            .where(Post.workspace_id == ctx.workspace.id, PostMetric.collected_at >= since)
             .group_by(func.date(PostMetric.collected_at))
             .order_by(func.date(PostMetric.collected_at))
-            .limit(90)
-        ).all()
-        totals = {
-            "impressions": sum(int(row.impressions or 0) for row in rows),
-            "engagements": sum(int(row.engagements or 0) for row in rows),
-        }
-        account_rows = list(
-            session.execute(
-                select(AccountMetricDaily, SocialAccount)
-                .join(SocialAccount, AccountMetricDaily.social_account_id == SocialAccount.id)
-                .where(SocialAccount.workspace_id == ctx.workspace.id)
-                .order_by(desc(AccountMetricDaily.metric_date))
-                .limit(30)
-            )
         )
+        if platform != "all":
+            chart_query = chart_query.where(SocialAccount.platform == platform)
+        rows = session.execute(chart_query).all()
+
+        latest = (
+            select(
+                PostMetric.post_target_id.label("target_id"),
+                func.max(PostMetric.collected_at).label("latest_at"),
+            )
+            .where(PostMetric.collected_at >= since)
+            .group_by(PostMetric.post_target_id)
+            .subquery()
+        )
+        content_query = (
+            select(PostMetric, Post, SocialAccount)
+            .join(
+                latest,
+                (latest.c.target_id == PostMetric.post_target_id)
+                & (latest.c.latest_at == PostMetric.collected_at),
+            )
+            .join(PostTarget, PostMetric.post_target_id == PostTarget.id)
+            .join(Post, PostTarget.post_id == Post.id)
+            .join(SocialAccount, PostTarget.social_account_id == SocialAccount.id)
+            .where(Post.workspace_id == ctx.workspace.id)
+        )
+        if platform != "all":
+            content_query = content_query.where(SocialAccount.platform == platform)
+        content_rows = list(session.execute(content_query))
+
+        account_query = (
+            select(AccountMetricDaily, SocialAccount)
+            .join(SocialAccount, AccountMetricDaily.social_account_id == SocialAccount.id)
+            .where(
+                SocialAccount.workspace_id == ctx.workspace.id,
+                AccountMetricDaily.metric_date >= since.date(),
+            )
+            .order_by(desc(AccountMetricDaily.metric_date))
+        )
+        audience_query = (
+            select(AudienceMetricDaily, SocialAccount)
+            .join(SocialAccount, AudienceMetricDaily.social_account_id == SocialAccount.id)
+            .where(
+                SocialAccount.workspace_id == ctx.workspace.id,
+                AudienceMetricDaily.metric_date >= since.date(),
+            )
+            .order_by(desc(AudienceMetricDaily.metric_date))
+        )
+        if platform != "all":
+            account_query = account_query.where(SocialAccount.platform == platform)
+            audience_query = audience_query.where(SocialAccount.platform == platform)
+        all_account_rows = list(session.execute(account_query))
+        all_audience_rows = list(session.execute(audience_query))
+
+    account_rows = []
+    seen_accounts = set()
+    for metric, account in all_account_rows:
+        if account.id not in seen_accounts:
+            account_rows.append((metric, account))
+            seen_accounts.add(account.id)
+
+    content_metrics: dict[str, dict[str, int]] = {}
+    filtered_content_rows = []
+    for metric, post, account in content_rows:
+        kind = _analytics_content_type(metric, post)
+        bucket = content_metrics.setdefault(
+            kind,
+            {"posts": 0, "impressions": 0, "reach": 0, "engagements": 0, "clicks": 0},
+        )
+        bucket["posts"] += 1
+        bucket["impressions"] += metric.impressions
+        bucket["reach"] += metric.reach
+        bucket["engagements"] += metric.likes + metric.comments + metric.shares + metric.saves
+        bucket["clicks"] += metric.clicks
+        if content_type in {"all", kind}:
+            filtered_content_rows.append((metric, post, account, kind))
+
+    totals = {
+        "impressions": sum(row[0].impressions for row in filtered_content_rows),
+        "reach": sum(row[0].reach for row in filtered_content_rows),
+        "engagements": sum(
+            row[0].likes + row[0].comments + row[0].shares + row[0].saves
+            for row in filtered_content_rows
+        ),
+    }
+
+    audience_rows = []
+    seen_segments = set()
+    for metric, account in all_audience_rows:
+        key = (account.id, metric.dimension, metric.segment)
+        if key not in seen_segments:
+            audience_rows.append((metric, account))
+            seen_segments.add(key)
+
     chart_data = {
         "labels": [str(row.day) for row in rows],
         "impressions": [int(row.impressions or 0) for row in rows],
@@ -5237,11 +5912,138 @@ def analytics_page(sess):
     chart = Div(
         Div(
             H2("Performance over time"),
-            A("Export CSV", href="/analytics/export.csv", cls="btn small"),
+            Div(
+                A("Post CSV", href="/analytics/export.csv", cls="btn small"),
+                A(
+                    "Audience CSV",
+                    href=f"/analytics/audience.csv?{urlencode({'days': days, 'platform': platform})}",
+                    cls="btn small",
+                ),
+                cls="card-head-actions",
+            ),
             cls="card-head",
         ),
         Div(NotStr(_analytics_svg(chart_data)), cls="card-body chart-wrap"),
         cls="card",
+    )
+    content_table = [
+        Tr(
+            Td(kind.title()),
+            Td(values["posts"]),
+            Td(f"{values['impressions']:,}"),
+            Td(f"{values['reach']:,}"),
+            Td(f"{values['engagements']:,}"),
+            Td(
+                f"{(values['engagements'] / values['impressions'] * 100):.2f}%"
+                if values["impressions"]
+                else "—"
+            ),
+            Td(f"{values['clicks']:,}"),
+        )
+        for kind, values in sorted(
+            content_metrics.items(), key=lambda item: item[1]["impressions"], reverse=True
+        )
+        if content_type in {"all", kind}
+    ]
+    content_card = (
+        Div(
+            Div(H2("Performance by content type"), cls="card-head"),
+            Div(
+                Table(
+                    Thead(
+                        Tr(
+                            Th("Format"),
+                            Th("Posts"),
+                            Th("Impressions"),
+                            Th("Reach"),
+                            Th("Engagements"),
+                            Th("Rate"),
+                            Th("Clicks"),
+                        )
+                    ),
+                    Tbody(*content_table),
+                ),
+                cls="table-wrap",
+            ),
+            cls="card",
+        )
+        if content_table
+        else ""
+    )
+    audience_by_dimension: dict[str, list] = {}
+    for metric, account in audience_rows:
+        audience_by_dimension.setdefault(metric.dimension, []).append((metric, account))
+    audience_cards = []
+    for dimension, segments in audience_by_dimension.items():
+        total_value = sum(metric.value for metric, _account in segments)
+        audience_cards.append(
+            Div(
+                Div(H2(dimension.replace("_", " ").title()), cls="card-head"),
+                Div(
+                    *[
+                        Div(
+                            Div(
+                                Strong(metric.segment),
+                                Small(account.display_name or account.username),
+                            ),
+                            Div(
+                                Span(
+                                    cls="audience-bar-fill",
+                                    style=f"width:{min(100, metric.percentage or (metric.value / total_value * 100 if total_value else 0)):.2f}%",
+                                ),
+                                cls="audience-bar",
+                            ),
+                            Strong(
+                                f"{metric.percentage:.1f}%"
+                                if metric.percentage
+                                else f"{metric.value:,}"
+                            ),
+                            cls="audience-segment",
+                        )
+                        for metric, account in sorted(
+                            segments,
+                            key=lambda item: (item[0].percentage, item[0].value),
+                            reverse=True,
+                        )[:10]
+                    ],
+                    cls="audience-segments",
+                ),
+                cls="card audience-card",
+            )
+        )
+    filter_form = Form(
+        Select(
+            *[
+                Option(label, value=value, selected=days == value)
+                for value, label in (
+                    (7, "Last 7 days"),
+                    (30, "Last 30 days"),
+                    (90, "Last 90 days"),
+                    (365, "Last year"),
+                )
+            ],
+            name="days",
+        ),
+        Select(
+            Option("All networks", value="all", selected=platform == "all"),
+            *[
+                Option(name, value=value, selected=platform == value)
+                for value, name in PLATFORM_NAMES.items()
+            ],
+            name="platform",
+        ),
+        Select(
+            Option("All content", value="all", selected=content_type == "all"),
+            *[
+                Option(value.title(), value=value, selected=content_type == value)
+                for value in ("post", "image", "carousel", "video", "reel", "story")
+            ],
+            name="content_type",
+        ),
+        Button("Apply", type="submit", cls="btn primary small"),
+        method="get",
+        action="/analytics",
+        cls="analytics-filters",
     )
     table = (
         Div(
@@ -5273,7 +6075,8 @@ def analytics_page(sess):
         page_intro(
             "MEASURE",
             "Signals that help you improve.",
-            "Normalized metrics retain the raw provider response, so new fields can be added without losing history.",
+            "Compare networks, formats, audience segments, and account growth while retaining every raw provider response.",
+            filter_form,
         ),
         Div(
             stat_card("Impressions", f"{totals['impressions']:,}"),
@@ -5284,12 +6087,18 @@ def analytics_page(sess):
                 if totals["impressions"]
                 else "—",
             ),
-            stat_card("Snapshots", len(rows)),
+            stat_card("Reach", f"{totals['reach']:,}"),
             cls="stats-grid",
         ),
         (
-            Div(chart, table, style="display:grid;gap:18px")
-            if rows
+            Div(
+                chart if rows else "",
+                content_card,
+                Div(*audience_cards, cls="audience-grid") if audience_cards else "",
+                table,
+                cls="analytics-stack",
+            )
+            if rows or content_table or audience_cards or account_table
             else empty_state(
                 "⌁",
                 "Analytics will appear here",
@@ -5353,6 +6162,53 @@ def analytics_export(sess):
     )
 
 
+@rt("/analytics/audience.csv")
+def audience_analytics_export(sess, days: int = 30, platform: str = "all"):
+    ctx = _context(sess)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    days = days if days in {7, 30, 90, 365} else 30
+    platform = platform if platform in PLATFORM_NAMES else "all"
+    query = (
+        select(AudienceMetricDaily, SocialAccount)
+        .join(SocialAccount, AudienceMetricDaily.social_account_id == SocialAccount.id)
+        .where(
+            SocialAccount.workspace_id == ctx.workspace.id,
+            AudienceMetricDaily.metric_date >= (date.today() - timedelta(days=days)),
+        )
+        .order_by(
+            AudienceMetricDaily.metric_date,
+            SocialAccount.platform,
+            AudienceMetricDaily.dimension,
+            AudienceMetricDaily.segment,
+        )
+    )
+    if platform != "all":
+        query = query.where(SocialAccount.platform == platform)
+    with session_scope() as session:
+        rows = list(session.execute(query))
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["date", "platform", "account", "dimension", "segment", "value", "percentage"])
+    for metric, account in rows:
+        writer.writerow(
+            [
+                metric.metric_date.isoformat(),
+                account.platform,
+                account.username,
+                metric.dimension,
+                metric.segment,
+                metric.value,
+                metric.percentage,
+            ]
+        )
+    return Response(
+        output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=fastsocial-audience.csv"},
+    )
+
+
 COMPETITOR_PLATFORMS = (
     "instagram",
     "facebook",
@@ -5368,19 +6224,27 @@ COMPETITOR_PLATFORMS = (
 
 
 @rt("/competitors", methods=["GET"])
-def competitors_page(sess, saved: str = "", error: str = ""):
+def competitors_page(sess, saved: str = "", error: str = "", favorites: int = 0):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
     with session_scope() as session:
-        profiles = list(
-            session.scalars(
-                select(CompetitorProfile)
-                .where(CompetitorProfile.workspace_id == ctx.workspace.id)
-                .options(selectinload(CompetitorProfile.snapshots))
-                .order_by(CompetitorProfile.platform, CompetitorProfile.display_name)
+        query = (
+            select(CompetitorProfile)
+            .where(CompetitorProfile.workspace_id == ctx.workspace.id)
+            .options(
+                selectinload(CompetitorProfile.snapshots),
+                selectinload(CompetitorProfile.posts),
+            )
+            .order_by(
+                desc(CompetitorProfile.favorite),
+                CompetitorProfile.platform,
+                CompetitorProfile.display_name,
             )
         )
+        if favorites:
+            query = query.where(CompetitorProfile.favorite.is_(True))
+        profiles = list(session.scalars(query))
     cards = []
     for profile in profiles:
         snapshots = sorted(profile.snapshots, key=lambda item: item.metric_date, reverse=True)
@@ -5401,7 +6265,21 @@ def competitors_page(sess, saved: str = "", error: str = ""):
                         ),
                         cls="competitor-title",
                     ),
-                    Span("TRACKING" if profile.active else "PAUSED", cls="mode-badge"),
+                    Div(
+                        Form(
+                            csrf_input(sess),
+                            Button(
+                                "★" if profile.favorite else "☆",
+                                type="submit",
+                                cls="competitor-favorite",
+                                title="Remove favorite" if profile.favorite else "Add favorite",
+                            ),
+                            method="post",
+                            action=f"/competitors/{profile.id}/favorite",
+                        ),
+                        Span("TRACKING" if profile.active else "PAUSED", cls="mode-badge"),
+                        cls="competitor-card-actions",
+                    ),
                     cls="integration-card-head",
                 ),
                 Div(
@@ -5451,9 +6329,62 @@ def competitors_page(sess, saved: str = "", error: str = ""):
                         cls="competitor-snapshot-form",
                     ),
                 ),
+                Details(
+                    Summary("Add content insight"),
+                    Form(
+                        csrf_input(sess),
+                        Input(
+                            name="external_post_id", placeholder="Platform post ID", required=True
+                        ),
+                        Input(
+                            type="datetime-local",
+                            name="published_at",
+                            value=utcnow().strftime("%Y-%m-%dT%H:%M"),
+                            required=True,
+                        ),
+                        Select(
+                            *[
+                                Option(value.title(), value=value)
+                                for value in ("post", "image", "carousel", "video", "reel", "story")
+                            ],
+                            name="content_type",
+                        ),
+                        Input(name="text", placeholder="Caption or summary"),
+                        Input(type="url", name="url", placeholder="https://…"),
+                        Input(type="number", name="reach", placeholder="Reach", min="0"),
+                        Input(type="number", name="engagement", placeholder="Engagement", min="0"),
+                        Button("Save content", type="submit", cls="btn primary small"),
+                        method="post",
+                        action=f"/competitors/{profile.id}/posts",
+                        cls="competitor-post-form",
+                    ),
+                ),
                 cls="competitor-card",
             )
         )
+    comparison_rows = []
+    for profile in profiles:
+        snapshots = sorted(profile.snapshots, key=lambda item: item.metric_date, reverse=True)
+        if not snapshots:
+            continue
+        latest = snapshots[0]
+        oldest = snapshots[-1]
+        comparison_rows.append(
+            Tr(
+                Td("★" if profile.favorite else ""),
+                Td(profile.display_name or profile.handle),
+                Td(profile.platform.title()),
+                Td(f"{latest.followers:,}"),
+                Td(f"{latest.followers - oldest.followers:+,}"),
+                Td(f"{latest.engagement_rate:.2f}%"),
+                Td(f"{latest.reach:,}"),
+            )
+        )
+    top_posts = sorted(
+        [(post, profile) for profile in profiles for post in profile.posts],
+        key=lambda item: item[0].engagement,
+        reverse=True,
+    )[:20]
     add_form = Form(
         csrf_input(sess),
         Div(
@@ -5499,8 +6430,21 @@ def competitors_page(sess, saved: str = "", error: str = ""):
         page_intro(
             "BENCHMARK",
             "Know what changed around you.",
-            "Track competitor growth and engagement beside your own metrics. Manual snapshots and future official collectors share one history.",
-            A("Export CSV", href="/competitors/export.csv", cls="btn"),
+            "Compare competitor growth, content formats, and top posts beside your own performance. Manual entries and provider collectors share one history.",
+            Div(
+                A(
+                    "All",
+                    href="/competitors",
+                    cls=f"btn small{' primary' if not favorites else ''}",
+                ),
+                A(
+                    "Favorites",
+                    href="/competitors?favorites=1",
+                    cls=f"btn small{' primary' if favorites else ''}",
+                ),
+                A("Export CSV", href="/competitors/export.csv", cls="btn"),
+                cls="report-actions",
+            ),
         ),
         Div(
             stat_card("Tracked profiles", len(profiles)),
@@ -5511,6 +6455,69 @@ def competitors_page(sess, saved: str = "", error: str = ""):
             stat_card("Brand", "Personal", ctx.workspace.name),
             cls="stats-grid",
         ),
+        Div(
+            Div(H2("Profile comparison"), cls="card-head"),
+            Div(
+                Table(
+                    Thead(
+                        Tr(
+                            Th(""),
+                            Th("Competitor"),
+                            Th("Network"),
+                            Th("Followers"),
+                            Th("Growth"),
+                            Th("Engagement rate"),
+                            Th("Reach"),
+                        )
+                    ),
+                    Tbody(*comparison_rows),
+                ),
+                cls="table-wrap",
+            ),
+            cls="card competitor-comparison",
+        )
+        if comparison_rows
+        else "",
+        Div(
+            Div(H2("Top competitor content"), cls="card-head"),
+            Div(
+                Table(
+                    Thead(
+                        Tr(
+                            Th("Competitor"),
+                            Th("Published"),
+                            Th("Format"),
+                            Th("Content"),
+                            Th("Engagement"),
+                            Th("Reach"),
+                            Th(""),
+                        )
+                    ),
+                    Tbody(
+                        *[
+                            Tr(
+                                Td(profile.display_name or profile.handle),
+                                Td(_format_datetime(post.published_at, ctx.workspace.timezone)),
+                                Td(post.content_type.title()),
+                                Td((post.text or "Untitled post")[:180]),
+                                Td(f"{post.engagement:,}"),
+                                Td(f"{post.reach:,}"),
+                                Td(
+                                    A("Open", href=post.url, target="_blank", rel="noopener")
+                                    if post.url
+                                    else ""
+                                ),
+                            )
+                            for post, profile in top_posts
+                        ]
+                    ),
+                ),
+                cls="table-wrap",
+            ),
+            cls="card competitor-content-card",
+        )
+        if top_posts
+        else "",
         Div(*cards, cls="competitor-grid") if cards else "",
         Div(H2("Track another profile"), cls="section-heading"),
         add_form,
@@ -5617,6 +6624,97 @@ async def competitor_snapshot(competitor_id: str, request, sess):
         return RedirectResponse(f"/competitors?error={quote_plus(str(exc))}", status_code=303)
 
 
+@rt("/competitors/{competitor_id}/favorite", methods=["POST"])
+async def competitor_favorite(competitor_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(competitor_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        profile = session.scalar(
+            select(CompetitorProfile).where(
+                CompetitorProfile.id == parsed,
+                CompetitorProfile.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not profile:
+            return Response("Not found", status_code=404)
+        profile.favorite = not profile.favorite
+        audit(session, ctx.workspace.id, ctx.user.id, "competitor.favorite.updated", profile)
+    return RedirectResponse("/competitors?saved=1", status_code=303)
+
+
+@rt("/competitors/{competitor_id}/posts", methods=["POST"])
+async def competitor_post_save(competitor_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(competitor_id)
+        external_id = str(form.get("external_post_id") or "").strip()
+        content_type = str(form.get("content_type") or "post").lower()
+        published_at = datetime.fromisoformat(str(form.get("published_at") or ""))
+        published_at = published_at.replace(tzinfo=ZoneInfo(ctx.workspace.timezone)).astimezone(UTC)
+        url = str(form.get("url") or "").strip()
+        if not external_id or content_type not in {
+            "post",
+            "image",
+            "carousel",
+            "video",
+            "reel",
+            "story",
+        }:
+            raise ValueError("Post ID, date, and supported content type are required")
+        if url and (urlparse(url).scheme not in {"http", "https"} or not urlparse(url).netloc):
+            raise ValueError("Post URL must start with http:// or https://")
+        with session_scope() as session:
+            profile = session.scalar(
+                select(CompetitorProfile).where(
+                    CompetitorProfile.id == parsed,
+                    CompetitorProfile.workspace_id == ctx.workspace.id,
+                )
+            )
+            if not profile:
+                return Response("Not found", status_code=404)
+            row = session.scalar(
+                select(CompetitorPost).where(
+                    CompetitorPost.competitor_id == profile.id,
+                    CompetitorPost.external_post_id == external_id,
+                )
+            )
+            if not row:
+                row = CompetitorPost(
+                    competitor_id=profile.id,
+                    external_post_id=external_id,
+                    published_at=published_at,
+                )
+                session.add(row)
+            row.text = str(form.get("text") or "").strip()
+            row.url = url
+            row.content_type = content_type
+            row.published_at = published_at
+            row.reach = max(0, int(form.get("reach") or 0))
+            row.engagement = max(0, int(form.get("engagement") or 0))
+            row.collected_at = utcnow()
+            audit(session, ctx.workspace.id, ctx.user.id, "competitor.post.saved", row)
+        return RedirectResponse("/competitors?saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/competitors?error={quote_plus(str(exc))}", status_code=303)
+
+
 @rt("/competitors/export.csv")
 def competitors_export(sess):
     ctx = _context(sess)
@@ -5635,6 +6733,12 @@ def competitors_export(sess):
                 CompetitorProfile.handle,
                 CompetitorMetricDaily.metric_date,
             )
+        ).all()
+        post_rows = session.execute(
+            select(CompetitorProfile, CompetitorPost)
+            .join(CompetitorPost, CompetitorPost.competitor_id == CompetitorProfile.id)
+            .where(CompetitorProfile.workspace_id == ctx.workspace.id)
+            .order_by(CompetitorPost.published_at)
         ).all()
     output = io.StringIO()
     writer = csv.writer(output)
@@ -5661,6 +6765,32 @@ def competitors_export(sess):
                 metric.engagement,
                 metric.reach,
                 metric.engagement_rate,
+            ]
+        )
+    writer.writerow([])
+    writer.writerow(
+        [
+            "top_content_platform",
+            "handle",
+            "published_at",
+            "content_type",
+            "text",
+            "engagement",
+            "reach",
+            "url",
+        ]
+    )
+    for profile, post in post_rows:
+        writer.writerow(
+            [
+                profile.platform,
+                profile.handle,
+                post.published_at.isoformat(),
+                post.content_type,
+                post.text,
+                post.engagement,
+                post.reach,
+                post.url,
             ]
         )
     return Response(
@@ -8031,9 +9161,36 @@ async def smartlink_detail(page_id: str, request, sess, saved: str = "", error: 
             row.published = form.get("published") == "on"
             audit(session, ctx.workspace.id, ctx.user.id, "smartlink.updated", row)
         return RedirectResponse(f"/smartlinks/{page.id}?saved=1", status_code=303)
+    analytics_since = utcnow() - timedelta(days=30)
+    with session_scope() as session:
+        events = list(
+            session.scalars(
+                select(SmartLinkEvent)
+                .where(
+                    SmartLinkEvent.page_id == page.id,
+                    SmartLinkEvent.occurred_at >= analytics_since,
+                )
+                .order_by(SmartLinkEvent.occurred_at)
+            )
+        )
+    daily: dict[date, dict[str, int]] = {}
+    for event in events:
+        event_date = event.occurred_at.date()
+        bucket = daily.setdefault(event_date, {"view": 0, "click": 0})
+        bucket[event.event_type] = bucket.get(event.event_type, 0) + 1
+    views = sum(event.event_type == "view" for event in events)
+    clicks = sum(event.event_type == "click" for event in events)
+    unique_visitors = len({event.visitor_hash for event in events if event.visitor_hash})
+    referrers: dict[str, int] = {}
+    for event in events:
+        if event.referrer_domain:
+            referrers[event.referrer_domain] = referrers.get(event.referrer_domain, 0) + 1
     preview_links = [
         Div(
-            Div(Strong(item.label), Small(item.url)),
+            Div(
+                Strong(item.label),
+                Small(f"{item.item_type.title()} · {item.description or item.url}"),
+            ),
             Span(f"{item.click_count:,} clicks", cls="mode-badge"),
             cls="smartlink-editor-item",
         )
@@ -8062,14 +9219,79 @@ async def smartlink_detail(page_id: str, request, sess, saved: str = "", error: 
     )
     add_item = Form(
         csrf_input(sess),
+        Select(
+            Option("Button / link", value="link"),
+            Option("Image card", value="image"),
+            Option("Video card", value="video"),
+            name="item_type",
+        ),
         Input(name="label", placeholder="Link label", required=True),
         Input(type="url", name="url", placeholder="https://example.com", required=True),
+        Input(
+            type="url",
+            name="media_url",
+            placeholder="Image/video URL (for media cards)",
+        ),
+        Input(name="description", placeholder="Optional supporting text"),
         Button("Add link", type="submit", cls="btn primary"),
         method="post",
         action=f"/smartlinks/{page.id}/items",
         cls="smartlink-item-form",
     )
     public_url = f"{settings().service_url}/s/{page.slug}"
+    analytics_panel = Div(
+        Div(
+            H2("SmartLink analytics · 30 days"),
+            A("Export CSV", href=f"/smartlinks/{page.id}/analytics.csv", cls="btn small"),
+            cls="card-head",
+        ),
+        Div(
+            stat_card("Views", f"{views:,}"),
+            stat_card("Visitors", f"{unique_visitors:,}"),
+            stat_card("Clicks", f"{clicks:,}"),
+            stat_card("CTR", f"{(clicks / views * 100):.1f}%" if views else "—"),
+            cls="stats-grid smartlink-analytics-stats",
+        ),
+        Div(
+            Div(
+                H3("Daily trend"),
+                Table(
+                    Thead(Tr(Th("Date"), Th("Views"), Th("Clicks"), Th("CTR"))),
+                    Tbody(
+                        *[
+                            Tr(
+                                Td(metric_date.isoformat()),
+                                Td(values["view"]),
+                                Td(values["click"]),
+                                Td(
+                                    f"{(values['click'] / values['view'] * 100):.1f}%"
+                                    if values["view"]
+                                    else "—"
+                                ),
+                            )
+                            for metric_date, values in sorted(daily.items(), reverse=True)
+                        ]
+                    ),
+                )
+                if daily
+                else P("Open the public page to begin the trend.", cls="form-help"),
+                cls="smartlink-analytics-panel",
+            ),
+            Div(
+                H3("Top referrers"),
+                *[
+                    Div(Span(referrer), Strong(str(count)), cls="website-rank-row")
+                    for referrer, count in sorted(
+                        referrers.items(), key=lambda item: item[1], reverse=True
+                    )[:10]
+                ],
+                P("No referrers recorded yet.", cls="form-help") if not referrers else "",
+                cls="smartlink-analytics-panel",
+            ),
+            cls="smartlink-analytics-grid",
+        ),
+        cls="card smartlink-analytics-card",
+    )
     return _app_page(
         ctx,
         page.title,
@@ -8080,7 +9302,16 @@ async def smartlink_detail(page_id: str, request, sess, saved: str = "", error: 
             "SMARTLINK EDITOR",
             page.title,
             public_url,
-            A("Open public page", href=f"/s/{page.slug}", target="_blank", cls="btn"),
+            Div(
+                A("Open public page", href=f"/s/{page.slug}", target="_blank", cls="btn"),
+                Form(
+                    csrf_input(sess),
+                    Button("Clone page", type="submit", cls="btn"),
+                    method="post",
+                    action=f"/smartlinks/{page.id}/clone",
+                ),
+                cls="report-actions",
+            ),
         ),
         Div(
             Div(
@@ -8103,6 +9334,7 @@ async def smartlink_detail(page_id: str, request, sess, saved: str = "", error: 
             ),
             cls="smartlink-editor-layout",
         ),
+        analytics_panel,
     )
 
 
@@ -8119,12 +9351,25 @@ async def smartlink_item_add(page_id: str, request, sess):
     form = await request.form()
     if not verify_csrf(sess, form.get("csrf")):
         return Response("Forbidden", status_code=403)
+    item_type = str(form.get("item_type") or "link").strip().lower()
     label = str(form.get("label") or "").strip()
     url = str(form.get("url") or "").strip()
+    media_url = str(form.get("media_url") or "").strip()
+    description = str(form.get("description") or "").strip()
     parsed = urlparse(url)
-    if not label or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    parsed_media = urlparse(media_url) if media_url else None
+    invalid_media = item_type in {"image", "video"} and (
+        not parsed_media or parsed_media.scheme not in {"http", "https"} or not parsed_media.netloc
+    )
+    if (
+        not label
+        or item_type not in {"link", "image", "video"}
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or invalid_media
+    ):
         return RedirectResponse(
-            f"/smartlinks/{page.id}?error={quote_plus('Enter a label and a valid http(s) URL')}",
+            f"/smartlinks/{page.id}?error={quote_plus('Enter a label, destination, and valid media URL when required')}",
             status_code=303,
         )
     with session_scope() as session:
@@ -8132,6 +9377,9 @@ async def smartlink_item_add(page_id: str, request, sess):
             page_id=page.id,
             label=label,
             url=url,
+            item_type=item_type,
+            description=description[:1000],
+            media_url=media_url,
             position=max([value.position for value in page.items] or [-1]) + 1,
         )
         session.add(item)
@@ -8140,8 +9388,167 @@ async def smartlink_item_add(page_id: str, request, sess):
     return RedirectResponse(f"/smartlinks/{page.id}?saved=1", status_code=303)
 
 
+@rt("/smartlinks/{page_id}/clone", methods=["POST"])
+async def smartlink_clone(page_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(page_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        source = session.scalar(
+            select(SmartLinkPage)
+            .where(
+                SmartLinkPage.id == parsed,
+                SmartLinkPage.workspace_id == ctx.workspace.id,
+            )
+            .options(selectinload(SmartLinkPage.items))
+        )
+        if not source:
+            return Response("Not found", status_code=404)
+        base_slug = f"{source.slug}-copy"[:110]
+        clone_slug = base_slug
+        counter = 2
+        while session.scalar(select(SmartLinkPage.id).where(SmartLinkPage.slug == clone_slug)):
+            clone_slug = f"{base_slug}-{counter}"[:120]
+            counter += 1
+        clone = SmartLinkPage(
+            workspace_id=ctx.workspace.id,
+            slug=clone_slug,
+            title=f"{source.title} copy"[:255],
+            bio=source.bio,
+            theme=source.theme,
+            published=False,
+            created_by=ctx.user.id,
+        )
+        session.add(clone)
+        session.flush()
+        session.add_all(
+            [
+                SmartLinkItem(
+                    page_id=clone.id,
+                    label=item.label,
+                    url=item.url,
+                    item_type=item.item_type,
+                    description=item.description,
+                    media_url=item.media_url,
+                    position=item.position,
+                    active=item.active,
+                )
+                for item in source.items
+            ]
+        )
+        audit(
+            session,
+            ctx.workspace.id,
+            ctx.user.id,
+            "smartlink.cloned",
+            clone,
+            {"source_page_id": str(source.id)},
+        )
+        clone_id = clone.id
+    return RedirectResponse(f"/smartlinks/{clone_id}?saved=1", status_code=303)
+
+
+@rt("/smartlinks/{page_id}/analytics.csv")
+def smartlink_analytics_export(page_id: str, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    try:
+        parsed = uuid.UUID(page_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        page = session.scalar(
+            select(SmartLinkPage).where(
+                SmartLinkPage.id == parsed,
+                SmartLinkPage.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not page:
+            return Response("Not found", status_code=404)
+        rows = list(
+            session.execute(
+                select(SmartLinkEvent, SmartLinkItem)
+                .outerjoin(SmartLinkItem, SmartLinkEvent.item_id == SmartLinkItem.id)
+                .where(SmartLinkEvent.page_id == page.id)
+                .order_by(SmartLinkEvent.occurred_at)
+            )
+        )
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "occurred_at",
+            "event_type",
+            "item",
+            "visitor",
+            "referrer",
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+        ]
+    )
+    for event, item in rows:
+        metadata = event.event_metadata or {}
+        writer.writerow(
+            [
+                event.occurred_at.isoformat(),
+                event.event_type,
+                item.label if item else "",
+                event.visitor_hash,
+                event.referrer_domain,
+                metadata.get("utm_source", ""),
+                metadata.get("utm_medium", ""),
+                metadata.get("utm_campaign", ""),
+            ]
+        )
+    return Response(
+        output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=smartlink-{page.slug}.csv"},
+    )
+
+
+def _smartlink_visitor_hash(request, page_id: uuid.UUID) -> str:
+    client_host = request.client.host if request.client else ""
+    user_agent = request.headers.get("user-agent", "")[:500]
+    daily_salt = date.today().isoformat()
+    return hashlib.sha256(
+        f"{settings().app_secret}:{page_id}:{daily_salt}:{client_host}:{user_agent}".encode()
+    ).hexdigest()
+
+
+def _smartlink_public_item(slug: str, item: tuple):
+    item_id, label, item_type, description, media_url = item
+    tracked_href = f"/s/{slug}/go/{item_id}"
+    copy = Div(Strong(label), Small(description) if description else "")
+    if item_type == "image":
+        return A(
+            Img(src=media_url, alt=label, loading="lazy"),
+            copy,
+            href=tracked_href,
+            cls="smartlink-public-media image",
+        )
+    if item_type == "video":
+        return Div(
+            Video(src=media_url, controls=True, preload="metadata"),
+            A(copy, href=tracked_href, cls="smartlink-public-media-action"),
+            cls="smartlink-public-media video",
+        )
+    return A(copy, href=tracked_href, cls="smartlink-public-link")
+
+
 @rt("/s/{slug}")
-def smartlink_public(slug: str):
+def smartlink_public(slug: str, request):
     with session_scope() as session:
         page = session.scalar(
             select(SmartLinkPage)
@@ -8152,7 +9559,26 @@ def smartlink_public(slug: str):
             return Response("SmartLink not found", status_code=404)
         page.view_count += 1
         title, bio, theme = page.title, page.bio, page.theme
-        items = [(item.id, item.label) for item in page.items if item.active]
+        items = [
+            (item.id, item.label, item.item_type, item.description, item.media_url)
+            for item in page.items
+            if item.active
+        ]
+        referrer = urlparse(request.headers.get("referer", "")).hostname or ""
+        utm_metadata = {
+            key: str(request.query_params.get(key) or "")[:255]
+            for key in ("utm_source", "utm_medium", "utm_campaign")
+            if request.query_params.get(key)
+        }
+        session.add(
+            SmartLinkEvent(
+                page_id=page.id,
+                event_type="view",
+                visitor_hash=_smartlink_visitor_hash(request, page.id),
+                referrer_domain=referrer[:255],
+                event_metadata=utm_metadata,
+            )
+        )
     return Html(
         head(title),
         Body(
@@ -8160,10 +9586,7 @@ def smartlink_public(slug: str):
                 Span("FS", cls="smartlink-public-avatar"),
                 H1(title),
                 P(bio),
-                *[
-                    A(label, href=f"/s/{slug}/go/{item_id}", cls="smartlink-public-link")
-                    for item_id, label in items
-                ],
+                *[_smartlink_public_item(slug, item) for item in items],
                 Small("Powered by FastSocial"),
                 cls=f"smartlink-public-page theme-{theme}",
             )
@@ -8172,7 +9595,7 @@ def smartlink_public(slug: str):
 
 
 @rt("/s/{slug}/go/{item_id}")
-def smartlink_redirect(slug: str, item_id: str):
+def smartlink_redirect(slug: str, item_id: str, request):
     try:
         parsed_item = uuid.UUID(item_id)
     except ValueError:
@@ -8191,6 +9614,16 @@ def smartlink_redirect(slug: str, item_id: str):
         if not item or urlparse(item.url).scheme not in {"http", "https"}:
             return Response("Not found", status_code=404)
         item.click_count += 1
+        referrer = urlparse(request.headers.get("referer", "")).hostname or ""
+        session.add(
+            SmartLinkEvent(
+                page_id=item.page_id,
+                item_id=item.id,
+                event_type="click",
+                visitor_hash=_smartlink_visitor_hash(request, item.page_id),
+                referrer_domain=referrer[:255],
+            )
+        )
         destination = item.url
     return RedirectResponse(destination, status_code=302)
 
@@ -8239,6 +9672,142 @@ def approvals_page(sess):
             "Owners and admins can approve or reject submitted posts. Your personal workspace currently bypasses this step.",
         ),
         content,
+    )
+
+
+@rt("/brands")
+async def brands_page(request, sess, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if request.method == "POST":
+        form = await request.form()
+        if not verify_csrf(sess, form.get("csrf")):
+            return Response("Forbidden", status_code=403)
+        try:
+            name = str(form.get("name") or "").strip()
+            timezone_name = str(form.get("timezone") or ctx.workspace.timezone).strip()
+            with session_scope() as session:
+                owner = session.get(User, ctx.user.id)
+                workspace = create_workspace(
+                    session,
+                    owner=owner,
+                    name=name,
+                    timezone=timezone_name,
+                )
+                session.flush()
+                audit(session, workspace.id, owner.id, "brand.created", workspace)
+                workspace_id = workspace.id
+            sess["workspace_id"] = str(workspace_id)
+            return RedirectResponse("/brands?saved=created", status_code=303)
+        except Exception as exc:  # noqa: BLE001
+            return RedirectResponse(f"/brands?error={quote_plus(str(exc))}", status_code=303)
+
+    with session_scope() as session:
+        rows = list(
+            session.execute(
+                select(Workspace, WorkspaceMember)
+                .join(WorkspaceMember, WorkspaceMember.workspace_id == Workspace.id)
+                .where(WorkspaceMember.user_id == ctx.user.id)
+                .order_by(Workspace.created_at, Workspace.name)
+            )
+        )
+        account_counts = dict(
+            session.execute(
+                select(SocialAccount.workspace_id, func.count(SocialAccount.id))
+                .where(SocialAccount.workspace_id.in_([row[0].id for row in rows]))
+                .group_by(SocialAccount.workspace_id)
+            ).all()
+        )
+        post_counts = dict(
+            session.execute(
+                select(Post.workspace_id, func.count(Post.id))
+                .where(Post.workspace_id.in_([row[0].id for row in rows]))
+                .group_by(Post.workspace_id)
+            ).all()
+        )
+    cards = [
+        Div(
+            Div(
+                Div(
+                    Span(workspace.name[:1].upper(), cls="brand-card-avatar"),
+                    Div(H2(workspace.name), Small(f"{membership.role.value.title()} access")),
+                ),
+                Span("ACTIVE" if workspace.id == ctx.workspace.id else "BRAND", cls="mode-badge"),
+                cls="integration-card-head",
+            ),
+            Div(
+                Div(Strong(str(account_counts.get(workspace.id, 0))), Span("accounts")),
+                Div(Strong(str(post_counts.get(workspace.id, 0))), Span("posts")),
+                Div(Strong(workspace.timezone), Span("timezone")),
+                cls="brand-stats",
+            ),
+            Form(
+                csrf_input(sess),
+                Input(type="hidden", name="next", value="/"),
+                Button(
+                    "Current brand" if workspace.id == ctx.workspace.id else "Switch to brand",
+                    type="submit",
+                    cls="btn primary" if workspace.id != ctx.workspace.id else "btn",
+                    disabled=True if workspace.id == ctx.workspace.id else None,
+                ),
+                method="post",
+                action=f"/brands/{workspace.id}/switch",
+            ),
+            cls="card brand-card",
+        )
+        for workspace, membership in rows
+    ]
+    return _app_page(
+        ctx,
+        "Brands",
+        "/brands",
+        flash("Brand workspace created and selected." if saved == "created" else ""),
+        flash(error, "error"),
+        page_intro(
+            "MULTI-BRAND",
+            "One operating system for every brand.",
+            "Each brand keeps its own accounts, content, media, analytics, inbox, reports, and model settings. Switch without mixing tenant data.",
+        ),
+        Div(*cards, cls="brand-grid"),
+        Div(H2("Create another brand"), cls="section-heading"),
+        Form(
+            csrf_input(sess),
+            Div(Label("Brand name"), Input(name="name", required=True), cls="field"),
+            Div(
+                Label("Timezone"),
+                Input(name="timezone", value=ctx.workspace.timezone, required=True),
+                Small("Use an IANA timezone such as Europe/Tallinn."),
+                cls="field",
+            ),
+            Button("Create brand", type="submit", cls="btn primary"),
+            method="post",
+            action="/brands",
+            cls="form-card brand-create-form",
+        ),
+    )
+
+
+@rt("/brands/{workspace_id}/switch", methods=["POST"])
+async def brand_switch(workspace_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(workspace_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        membership = membership_for(session, parsed, ctx.user.id)
+        if not membership:
+            return Response("Not found", status_code=404)
+    sess["workspace_id"] = str(parsed)
+    return RedirectResponse(
+        _workspace_return_path(str(form.get("next") or "/")),
+        status_code=303,
     )
 
 

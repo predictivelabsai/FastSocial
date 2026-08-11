@@ -8,10 +8,12 @@ from fastsocial.app import app
 from fastsocial.db import session_scope
 from fastsocial.models import (
     CompetitorMetricDaily,
+    CompetitorPost,
     CompetitorProfile,
     InboxConversation,
     InboxMessage,
     ReportSchedule,
+    SmartLinkEvent,
     SmartLinkItem,
     SmartLinkPage,
     User,
@@ -93,11 +95,38 @@ def test_metricool_parity_routes_are_tenant_safe_and_functional():
         )
         assert snapshot.status_code == 303
         competitors = client.get("/competitors")
+        favorite = client.post(
+            f"/competitors/{competitor_id}/favorite",
+            data={"csrf": _csrf(competitors)},
+            follow_redirects=False,
+        )
+        assert favorite.status_code == 303
+        competitors = client.get("/competitors")
+        content = client.post(
+            f"/competitors/{competitor_id}/posts",
+            data={
+                "csrf": _csrf(competitors),
+                "external_post_id": "rival-launch-reel",
+                "published_at": "2026-08-11T09:30",
+                "content_type": "reel",
+                "text": "A rival launch reel",
+                "url": "https://example.com/rival-launch-reel",
+                "reach": "22000",
+                "engagement": "1300",
+            },
+            follow_redirects=False,
+        )
+        assert content.status_code == 303
+        competitors = client.get("/competitors?favorites=1")
         assert "12,500" in competitors.text
         assert "3.64%" in competitors.text
+        assert "Profile comparison" in competitors.text
+        assert "Top competitor content" in competitors.text
+        assert "A rival launch reel" in competitors.text
         export = client.get("/competitors/export.csv")
         assert export.status_code == 200
         assert "example-rival" in export.text
+        assert "A rival launch reel" in export.text
 
         reports = client.get("/reports")
         scheduled = client.post(
@@ -156,16 +185,52 @@ def test_metricool_parity_routes_are_tenant_safe_and_functional():
             follow_redirects=False,
         )
         assert added_link.status_code == 303
+        rich_item = client.post(
+            f"{detail_path}/items",
+            data={
+                "csrf": _csrf(detail),
+                "item_type": "image",
+                "label": "Launch visual",
+                "description": "See the launch story",
+                "url": "https://fastsocial.org/launch",
+                "media_url": "https://fastsocial.org/static/favicon.svg",
+            },
+            follow_redirects=False,
+        )
+        assert rich_item.status_code == 303
 
-        public = client.get("/s/parity-links")
+        public = client.get(
+            "/s/parity-links?utm_source=test-suite&utm_campaign=parity",
+            headers={"referer": "https://example.com/article"},
+        )
         assert public.status_code == 200
         assert "Useful destinations." in public.text
+        assert "Launch visual" in public.text
+        assert "smartlink-public-media image" in public.text
         public_html = BeautifulSoup(public.text, "html.parser")
         tracked_link = public_html.select_one("a.smartlink-public-link")
         assert tracked_link is not None
         clicked = client.get(tracked_link["href"], follow_redirects=False)
         assert clicked.status_code == 302
         assert clicked.headers["location"] == "https://fastsocial.org/"
+
+        detail = client.get(detail_path)
+        assert "SmartLink analytics" in detail.text
+        assert "100.0%" in detail.text
+        analytics_export = client.get(f"{detail_path}/analytics.csv")
+        assert analytics_export.status_code == 200
+        assert "test-suite" in analytics_export.text
+        assert "example.com" in analytics_export.text
+        cloned = client.post(
+            f"{detail_path}/clone",
+            data={"csrf": _csrf(detail)},
+            follow_redirects=False,
+        )
+        assert cloned.status_code == 303
+        assert cloned.headers["location"].startswith("/smartlinks/")
+        clone_page = client.get(cloned.headers["location"])
+        assert "Parity Links copy" in clone_page.text
+        assert "Launch visual" in clone_page.text
 
         with TestClient(app) as outsider:
             _register(outsider, "parity-outsider@example.com")
@@ -183,10 +248,19 @@ def test_metricool_parity_routes_are_tenant_safe_and_functional():
                     CompetitorMetricDaily.competitor_id == competitor_id
                 )
             )
+            competitor_post = session.scalar(
+                select(CompetitorPost).where(CompetitorPost.competitor_id == competitor_id)
+            )
+            events = list(
+                session.scalars(select(SmartLinkEvent).where(SmartLinkEvent.page_id == page.id))
+            )
             assert page.view_count == 2
             assert item.click_count == 1
+            assert [event.event_type for event in events].count("view") == 2
+            assert [event.event_type for event in events].count("click") == 1
             assert schedule.recipients == ["owner@example.com"]
             assert metric.followers == 12500
+            assert competitor_post.engagement == 1300
 
 
 def test_inbox_renders_collected_conversations():

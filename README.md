@@ -8,7 +8,7 @@ through configurable Arcade/Composio MCP gateways.
 ## What is included
 
 - Password and Google OpenID Connect login
-- Isolated workspaces with owner, admin, editor, and viewer roles
+- Isolated Brands/workspaces with owner, admin, editor, and viewer roles, sidebar switching, and cross-brand repurposing
 - FastVC-style left navigation and a dedicated integration status page
 - Direct, Arcade MCP, and Composio MCP connection paths per social account
 - Capability-level MCP mappings for publishing, metrics, Inbox, Ads, competitors, and listening
@@ -20,15 +20,15 @@ through configurable Arcade/Composio MCP gateways.
 - Private local or Cloudflare R2 media library
 - Managed Canva, Google Drive, and Adobe Express media banks through Arcade/Composio MCP
 - Idempotent publishing worker with per-target retry state
-- Post/account metrics, server-rendered SVG analytics, and CSV export
-- Competitor profiles with historical growth/engagement snapshots and export
+- Post/account metrics, audience demographics, content-type comparisons, server-rendered SVG analytics, and CSV export
+- Competitor profiles with favorites, historical growth/engagement snapshots, top-content intelligence, and export
 - Unified brand reports with native PDF/editable PowerPoint/R2 artifacts and scheduled Postmark delivery
 - Grounded xAI/OpenAI Report Studio narratives plus revocable JSON feeds for BI, MCP, and custom dashboards
 - Meta, Google, and TikTok Ads campaign snapshots with spend, CPC, conversion, ROAS, and CSV export
 - Scheduled live provider collectors with per-account run history and exact failure visibility
 - Keyword/hashtag listening with reach, engagement, sentiment, and direct X recent-search support
 - Privacy-safe real-time website analytics for pageviews, visitors, referrers, and conversions
-- Public SmartLinks with themes plus live view and click measurement
+- Public SmartLinks with link/image/video cards, cloning, privacy-safe visitor/referrer/UTM analytics, and CSV export
 - Tenant-safe unified inbox with filters, bulk actions, notes, tags, moderation, assignment, saved replies, and provider dispatch
 - Personal publishing without approval; optional team approval workflow
 - Agentic Create / Generate → Review → Post chats with an optional autonomous YOLO mode
@@ -36,6 +36,7 @@ through configurable Arcade/Composio MCP gateways.
 - 49 editable, versioned marketing skills vendored from Corey's Marketing Skills
 - Encrypted xAI/OpenAI BYOK, configurable BYOM profiles, and gated server-key access
 - Text, image, and video generation with model and media provenance
+- Scoped, revocable automation tokens for REST, stateless MCP 2026, Zapier, and Make workflows
 - PostgreSQL migrations, Docker, local tests, and Coolify CI/CD scaffolding
 
 The application and all business workflows are Python. The UI is rendered with FastHTML and HTMX;
@@ -108,3 +109,6 @@ python scripts/coolify.py validate
 python scripts/coolify.py doctor
 python scripts/coolify.py status
 ```
+
+The implementation-to-product comparison is maintained in
+[docs/metricool-parity.md](docs/metricool-parity.md).

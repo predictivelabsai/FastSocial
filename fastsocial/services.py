@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import calendar as calendar_module
+import copy
 import hashlib
 import io
 import logging
 import uuid
 from collections.abc import Iterable
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from PIL import Image, UnidentifiedImageError
@@ -20,9 +21,11 @@ from fastsocial.models import (
     AccountMetricDaily,
     AccountStatus,
     AdCampaignDaily,
+    AudienceMetricDaily,
     AuditLog,
     CollectionRun,
     CompetitorMetricDaily,
+    CompetitorPost,
     CompetitorProfile,
     ContentAutolist,
     InboxConversation,
@@ -79,16 +82,38 @@ def slugify(value: str) -> str:
 
 
 def create_personal_workspace(session, user: User) -> Workspace:
-    base = slugify(user.name or user.email.split("@", 1)[0])
+    return create_workspace(
+        session,
+        owner=user,
+        name=f"{user.name or user.email.split('@', 1)[0]}'s workspace",
+        slug_base=user.name or user.email.split("@", 1)[0],
+    )
+
+
+def create_workspace(
+    session,
+    *,
+    owner: User,
+    name: str,
+    timezone: str = "Europe/Tallinn",
+    slug_base: str = "",
+) -> Workspace:
+    """Create an isolated Metricool-style brand workspace and its owner membership."""
+    clean_name = name.strip()
+    if not clean_name:
+        raise ValueError("Brand name is required")
+    ZoneInfo(timezone)
+    base = slugify(slug_base or clean_name)
     slug = base
     counter = 2
     while session.scalar(select(Workspace.id).where(Workspace.slug == slug)):
         slug = f"{base}-{counter}"
         counter += 1
     workspace = Workspace(
-        name=f"{user.name or user.email.split('@', 1)[0]}'s workspace",
+        name=clean_name[:200],
         slug=slug,
-        owner_id=user.id,
+        owner_id=owner.id,
+        timezone=timezone,
         approval_required=False,
         default_model_provider=(
             settings().model_provider if settings().model_provider in {"xai", "openai"} else "xai"
@@ -97,7 +122,7 @@ def create_personal_workspace(session, user: User) -> Workspace:
     session.add(workspace)
     session.flush()
     session.add(
-        WorkspaceMember(workspace_id=workspace.id, user_id=user.id, role=WorkspaceRole.owner)
+        WorkspaceMember(workspace_id=workspace.id, user_id=owner.id, role=WorkspaceRole.owner)
     )
     return workspace
 
@@ -240,6 +265,91 @@ def create_post(
             session.add(PostMedia(post_id=post.id, media_id=item.id, position=position))
     audit(session, workspace.id, user_id, "post.created", post, {"status": status.value})
     return post
+
+
+def repurpose_post_to_workspaces(
+    session,
+    *,
+    source_post_id: uuid.UUID,
+    destination_workspace_ids: list[uuid.UUID],
+    user_id: uuid.UUID,
+    include_media: bool = True,
+) -> list[Post]:
+    """Clone a post as an editable draft into every authorized destination brand."""
+    destination_ids = list(dict.fromkeys(destination_workspace_ids))
+    if not destination_ids:
+        raise ValueError("Choose at least one destination brand")
+    source = session.scalar(
+        select(Post)
+        .where(Post.id == source_post_id)
+        .options(selectinload(Post.media_links).selectinload(PostMedia.media))
+    )
+    if not source:
+        raise ValueError("Source post not found")
+    source_membership = membership_for(session, source.workspace_id, user_id)
+    if not source_membership:
+        raise ValueError("Source post not found")
+    memberships = list(
+        session.scalars(
+            select(WorkspaceMember).where(
+                WorkspaceMember.user_id == user_id,
+                WorkspaceMember.workspace_id.in_(destination_ids),
+                WorkspaceMember.role.in_(
+                    [WorkspaceRole.owner, WorkspaceRole.admin, WorkspaceRole.editor]
+                ),
+            )
+        )
+    )
+    allowed_ids = {item.workspace_id for item in memberships}
+    if allowed_ids != set(destination_ids) or source.workspace_id in allowed_ids:
+        raise ValueError("One or more destination brands are unavailable")
+
+    storage = media_storage()
+    media_bodies = (
+        [
+            (link, storage.get(link.media.storage_key))
+            for link in sorted(source.media_links, key=lambda item: item.position)
+        ]
+        if include_media
+        else []
+    )
+    created: list[Post] = []
+    for destination_id in destination_ids:
+        content = copy.deepcopy(source.content or {})
+        content["repurposed_from"] = {
+            "post_id": str(source.id),
+            "workspace_id": str(source.workspace_id),
+        }
+        clone = Post(
+            workspace_id=destination_id,
+            created_by=user_id,
+            status=PostStatus.draft,
+            content=content,
+            recurrence_rule="",
+        )
+        session.add(clone)
+        session.flush()
+        for position, (link, body) in enumerate(media_bodies):
+            copied_media = store_media(
+                session,
+                workspace_id=destination_id,
+                user_id=user_id,
+                filename=link.media.filename,
+                mime_type=link.media.mime_type,
+                body=body,
+            )
+            copied_media.alt_text = link.media.alt_text
+            session.add(PostMedia(post_id=clone.id, media_id=copied_media.id, position=position))
+        audit(
+            session,
+            destination_id,
+            user_id,
+            "post.repurposed",
+            clone,
+            {"source_post_id": str(source.id), "source_workspace_id": str(source.workspace_id)},
+        )
+        created.append(clone)
+    return created
 
 
 def store_media(
@@ -770,6 +880,59 @@ async def collect_provider_ads(workspace_id: uuid.UUID | None = None) -> int:
     return written
 
 
+def _upsert_competitor_posts(session, profile: CompetitorProfile, raw: dict) -> int:
+    recent_posts = raw.get("recent_posts") or raw.get("top_posts") or raw.get("content") or []
+    written = 0
+    for post_data in recent_posts:
+        if not isinstance(post_data, dict):
+            continue
+        external_id = str(post_data.get("post_id") or post_data.get("id") or "").strip()
+        if not external_id:
+            continue
+        published_value = str(
+            post_data.get("published_at") or post_data.get("created_at") or utcnow().isoformat()
+        )
+        try:
+            published_at = datetime.fromisoformat(published_value.replace("Z", "+00:00"))
+            if not published_at.tzinfo:
+                published_at = published_at.replace(tzinfo=UTC)
+        except ValueError:
+            published_at = utcnow()
+        row = session.scalar(
+            select(CompetitorPost).where(
+                CompetitorPost.competitor_id == profile.id,
+                CompetitorPost.external_post_id == external_id,
+            )
+        )
+        if not row:
+            row = CompetitorPost(
+                competitor_id=profile.id,
+                external_post_id=external_id,
+                published_at=published_at,
+            )
+            session.add(row)
+        row.text = str(post_data.get("text") or post_data.get("caption") or "")
+        row.url = str(post_data.get("url") or "")
+        row.content_type = str(post_data.get("content_type") or post_data.get("type") or "post")[
+            :40
+        ]
+        row.published_at = published_at
+        row.impressions = int(post_data.get("impressions") or 0)
+        row.reach = int(post_data.get("reach") or 0)
+        row.likes = int(post_data.get("likes") or 0)
+        row.comments = int(post_data.get("comments") or 0)
+        row.shares = int(post_data.get("shares") or 0)
+        row.engagement = int(
+            post_data.get("engagement")
+            or post_data.get("engagements")
+            or row.likes + row.comments + row.shares
+        )
+        row.raw = post_data
+        row.collected_at = utcnow()
+        written += 1
+    return written
+
+
 async def collect_provider_competitors(workspace_id: uuid.UUID | None = None) -> int:
     until = date.today()
     since = until - timedelta(days=7)
@@ -827,6 +990,10 @@ async def collect_provider_competitors(workspace_id: uuid.UUID | None = None) ->
                     row.collected_at = utcnow()
                     run.records_written += 1
                     written += 1
+                    post_count = _upsert_competitor_posts(session, profile, item.raw)
+                    run.records_seen += post_count
+                    run.records_written += post_count
+                    written += post_count
                 run.status = "success"
             except Exception as exc:  # noqa: BLE001
                 run.status = "failed"
@@ -949,6 +1116,27 @@ async def collect_metrics() -> int:
                 row.engagement = values.engagement
                 row.reach = values.reach
                 row.raw = values.raw
+                for segment in values.audience:
+                    audience_row = session.scalar(
+                        select(AudienceMetricDaily).where(
+                            AudienceMetricDaily.social_account_id == account.id,
+                            AudienceMetricDaily.metric_date == today,
+                            AudienceMetricDaily.dimension == segment.dimension,
+                            AudienceMetricDaily.segment == segment.segment,
+                        )
+                    )
+                    if not audience_row:
+                        audience_row = AudienceMetricDaily(
+                            social_account_id=account.id,
+                            metric_date=today,
+                            dimension=segment.dimension,
+                            segment=segment.segment,
+                        )
+                        session.add(audience_row)
+                    audience_row.value = segment.value
+                    audience_row.percentage = segment.percentage
+                    audience_row.raw = segment.raw
+                    audience_row.collected_at = utcnow()
                 count += 1
             except Exception:  # noqa: BLE001
                 log.exception("Account metrics failed for %s", account.id)

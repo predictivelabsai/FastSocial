@@ -409,6 +409,36 @@ class AccountMetricDaily(Base):
     raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class AudienceMetricDaily(Base):
+    __tablename__ = "audience_metrics_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "social_account_id",
+            "metric_date",
+            "dimension",
+            "segment",
+            name="uq_audience_metric_segment",
+        ),
+        Index(
+            "ix_audience_metrics_account_date",
+            "social_account_id",
+            "metric_date",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    social_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("social_accounts.id", ondelete="CASCADE"), index=True
+    )
+    metric_date: Mapped[date] = mapped_column(Date)
+    dimension: Mapped[str] = mapped_column(String(60))
+    segment: Mapped[str] = mapped_column(String(255))
+    value: Mapped[int] = mapped_column(BigInteger, default=0)
+    percentage: Mapped[float] = mapped_column(Float, default=0)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CompetitorProfile(Base):
     __tablename__ = "competitor_profiles"
     __table_args__ = (
@@ -425,6 +455,7 @@ class CompetitorProfile(Base):
     display_name: Mapped[str] = mapped_column(String(255), default="")
     profile_url: Mapped[str] = mapped_column(Text, default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     profile_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -432,6 +463,9 @@ class CompetitorProfile(Base):
     )
 
     snapshots: Mapped[list[CompetitorMetricDaily]] = relationship(
+        back_populates="competitor", cascade="all, delete-orphan"
+    )
+    posts: Mapped[list[CompetitorPost]] = relationship(
         back_populates="competitor", cascade="all, delete-orphan"
     )
 
@@ -457,6 +491,34 @@ class CompetitorMetricDaily(Base):
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     competitor: Mapped[CompetitorProfile] = relationship(back_populates="snapshots")
+
+
+class CompetitorPost(Base):
+    __tablename__ = "competitor_posts"
+    __table_args__ = (
+        UniqueConstraint("competitor_id", "external_post_id"),
+        Index("ix_competitor_posts_profile_published", "competitor_id", "published_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    competitor_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("competitor_profiles.id", ondelete="CASCADE"), index=True
+    )
+    external_post_id: Mapped[str] = mapped_column(String(500))
+    text: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    content_type: Mapped[str] = mapped_column(String(40), default="post")
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    impressions: Mapped[int] = mapped_column(BigInteger, default=0)
+    reach: Mapped[int] = mapped_column(BigInteger, default=0)
+    likes: Mapped[int] = mapped_column(BigInteger, default=0)
+    comments: Mapped[int] = mapped_column(BigInteger, default=0)
+    shares: Mapped[int] = mapped_column(BigInteger, default=0)
+    engagement: Mapped[int] = mapped_column(BigInteger, default=0)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    competitor: Mapped[CompetitorProfile] = relationship(back_populates="posts")
 
 
 class InboxConversation(Base):
@@ -652,6 +714,24 @@ class ReportConnector(Base):
     name: Mapped[str] = mapped_column(String(200))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     token_hint: Mapped[str] = mapped_column(String(20), default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AutomationToken(Base):
+    __tablename__ = "automation_tokens"
+    __table_args__ = (Index("ix_automation_tokens_workspace_active", "workspace_id", "active"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    token_hint: Mapped[str] = mapped_column(String(20), default="")
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -881,6 +961,9 @@ class SmartLinkPage(Base):
     items: Mapped[list[SmartLinkItem]] = relationship(
         back_populates="page", cascade="all, delete-orphan", order_by="SmartLinkItem.position"
     )
+    events: Mapped[list[SmartLinkEvent]] = relationship(
+        back_populates="page", cascade="all, delete-orphan"
+    )
 
 
 class SmartLinkItem(Base):
@@ -893,6 +976,9 @@ class SmartLinkItem(Base):
     )
     label: Mapped[str] = mapped_column(String(255))
     url: Mapped[str] = mapped_column(Text)
+    item_type: Mapped[str] = mapped_column(String(30), default="link")
+    description: Mapped[str] = mapped_column(Text, default="")
+    media_url: Mapped[str] = mapped_column(Text, default="")
     position: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     click_count: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -902,6 +988,31 @@ class SmartLinkItem(Base):
     )
 
     page: Mapped[SmartLinkPage] = relationship(back_populates="items")
+    events: Mapped[list[SmartLinkEvent]] = relationship(back_populates="item")
+
+
+class SmartLinkEvent(Base):
+    __tablename__ = "smartlink_events"
+    __table_args__ = (
+        Index("ix_smartlink_events_page_occurred", "page_id", "occurred_at"),
+        Index("ix_smartlink_events_page_visitor", "page_id", "visitor_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    page_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("smartlink_pages.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("smartlink_items.id", ondelete="CASCADE"), index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(30), default="view", index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    visitor_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    referrer_domain: Mapped[str] = mapped_column(String(255), default="")
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    page: Mapped[SmartLinkPage] = relationship(back_populates="events")
+    item: Mapped[SmartLinkItem | None] = relationship(back_populates="events")
 
 
 class PostApproval(Base):
