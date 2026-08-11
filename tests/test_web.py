@@ -65,6 +65,11 @@ def test_anonymous_landing_and_password_registration():
         assert new_post.status_code == 200
         assert "BYOK required" in new_post.text
         assert "YOLO" in new_post.text
+        new_post_html = BeautifulSoup(new_post.text, "html.parser")
+        assert new_post_html.select_one(".creation-chat-pane") is not None
+        assert new_post_html.select_one(".creation-artifact-pane") is not None
+        assert len(new_post_html.select(".prompt-suggestion-card")) == 4
+        assert new_post_html.select_one(".chat-composer-box textarea[name='brief']") is not None
 
         skills = client.get("/skills")
         assert skills.status_code == 200
@@ -211,6 +216,11 @@ def test_review_requires_explicit_approval_before_posting():
         assert review.status_code == 200
         assert "Approve for posting" in review.text
         assert "Publish now" not in review.text
+        review_html = BeautifulSoup(review.text, "html.parser")
+        assert review_html.select_one(".creation-chat-pane") is not None
+        assert review_html.select_one(".creation-artifact-pane .artifact-copy") is not None
+        assert len(review_html.select(".prompt-suggestion-card")) == 4
+        assert review_html.select_one(".creation-artifact-pane textarea") is None
         blocked = client.post(
             f"/chats/{chat_id}/post",
             data={
@@ -225,11 +235,7 @@ def test_review_requires_explicit_approval_before_posting():
         assert "Approve+the+current+artifact" in blocked.headers["location"]
         approved = client.post(
             f"/chats/{chat_id}/approve",
-            data={
-                "csrf": _csrf(review),
-                "text": "A factual product update, reviewed by a human.",
-                "variant_x": "A factual product update, reviewed by a human.",
-            },
+            data={"csrf": _csrf(review)},
             follow_redirects=False,
         )
         assert approved.status_code == 303
@@ -242,7 +248,7 @@ def test_review_requires_explicit_approval_before_posting():
             )
             chat = session.get(ChatSession, chat_id)
             assert artifact.status == ArtifactStatus.ready
-            assert artifact.content["text"].endswith("human.")
+            assert artifact.content["text"] == "A factual product update."
             assert chat.stage == WorkflowStage.post
             assert (
                 session.scalar(select(func.count(Post.id)).where(Post.workspace_id == workspace_id))
@@ -252,6 +258,15 @@ def test_review_requires_explicit_approval_before_posting():
         delivery = client.get(f"/chats/{chat_id}?saved=approved")
         assert "Content approved" in delivery.text
         assert "Publish now" in delivery.text
+        saved = client.post(
+            f"/chats/{chat_id}/post",
+            data={"csrf": _csrf(delivery), "delivery": "draft"},
+            follow_redirects=False,
+        )
+        assert saved.status_code == 303
+        with session_scope() as session:
+            post = session.scalar(select(Post).where(Post.workspace_id == workspace_id))
+            assert post.content["text"] == "A factual product update."
 
 
 def test_public_discovery_files_use_python_routes():

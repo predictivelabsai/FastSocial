@@ -17,6 +17,7 @@ from fasthtml.common import (
     H2,
     H3,
     A,
+    Aside,
     Body,
     Br,
     Button,
@@ -32,6 +33,7 @@ from fasthtml.common import (
     Option,
     P,
     Script,
+    Section,
     Select,
     Small,
     Span,
@@ -937,32 +939,55 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
         for account in ctx.accounts
         if account.status == AccountStatus.connected
     ]
-    return Div(
-        _workflow_steps(WorkflowStage.generate),
-        flash(error, "error"),
+    suggestions = (
+        (
+            "Launch a product",
+            "Create a launch post with a sharp hook, three concrete benefits, and a clear call to action.",
+        ),
+        (
+            "Teach something useful",
+            "Turn one useful lesson from my work into an educational post with a practical takeaway.",
+        ),
+        (
+            "Share a point of view",
+            "Develop a thoughtful contrarian point of view for my audience without sounding provocative for its own sake.",
+        ),
+        (
+            "Build a content series",
+            "Propose the first post in a five-part content series that builds authority with my target audience.",
+        ),
+    )
+    composer = Form(
+        csrf_input(sess),
         Div(
-            Form(
-                csrf_input(sess),
+            Textarea(
+                name="brief",
+                placeholder="Describe the post you want to create…",
+                autofocus=True,
+                rows="3",
+            ),
+            Button("↑", type="submit", cls="chat-send", title="Create post"),
+            cls="chat-composer-box",
+        ),
+        Div(
+            *[
+                Button(
+                    Strong(label),
+                    Small(prompt),
+                    type="submit",
+                    name="suggestion",
+                    value=prompt,
+                    cls="prompt-suggestion-card",
+                )
+                for label, prompt in suggestions
+            ],
+            cls="prompt-suggestions",
+        ),
+        Details(
+            Summary("Creation controls"),
+            Div(
                 Div(
-                    Span("CREATIVE BRIEF", cls="eyebrow accent"),
-                    H1("What should we create?"),
-                    P(
-                        "Describe the audience, idea, evidence, desired action, and anything the agents must avoid."
-                    ),
-                    cls="agent-workbench-head",
-                ),
-                Div(
-                    Label("Brief"),
-                    Textarea(
-                        name="brief",
-                        placeholder="Create a concise launch post for founders explaining…",
-                        required=True,
-                        autofocus=True,
-                    ),
-                    cls="field",
-                ),
-                Div(
-                    Label("Workflow"),
+                    Span("Workflow", cls="composer-control-label"),
                     Label(
                         Input(
                             type="radio",
@@ -970,11 +995,8 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
                             value="review",
                             checked=ctx.workspace.default_workflow_mode == WorkflowMode.review,
                         ),
-                        Div(
-                            Strong("Review"),
-                            Small("Generate, inspect and confirm before queueing."),
-                        ),
-                        cls="choice-card",
+                        "Review",
+                        cls="composer-chip",
                     ),
                     Label(
                         Input(
@@ -983,22 +1005,27 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
                             value="yolo",
                             checked=ctx.workspace.default_workflow_mode == WorkflowMode.yolo,
                         ),
-                        Div(Strong("YOLO"), Small("Generate, review and deliver autonomously.")),
-                        cls="choice-card warning",
+                        "YOLO",
+                        cls="composer-chip warning",
                     ),
-                    cls="field choice-grid",
+                    cls="composer-control-group",
                 ),
                 Div(
-                    Label("Generate media"),
-                    Div(
-                        Label(Input(type="checkbox", name="media_kinds", value="image"), " Image"),
-                        Label(Input(type="checkbox", name="media_kinds", value="video"), " Video"),
-                        cls="schedule-tabs",
+                    Span("Create with", cls="composer-control-label"),
+                    Label(
+                        Input(type="checkbox", name="media_kinds", value="image"),
+                        "Image",
+                        cls="composer-chip",
                     ),
-                    cls="field",
+                    Label(
+                        Input(type="checkbox", name="media_kinds", value="video"),
+                        "Video",
+                        cls="composer-chip",
+                    ),
+                    cls="composer-control-group",
                 ),
                 Div(
-                    Label("YOLO delivery"),
+                    Span("YOLO delivery", cls="composer-control-label"),
                     Select(
                         Option("Publish now", value="now", selected=True),
                         Option("Schedule", value="schedule"),
@@ -1006,39 +1033,86 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
                         name="delivery",
                     ),
                     Input(type="datetime-local", name="scheduled_at"),
-                    Small("Review mode always pauses before delivery."),
-                    cls="field",
+                    cls="composer-control-group delivery-controls",
                 ),
-                Button("Create with agents →", type="submit", cls="btn primary"),
-                method="post",
-                action="/new-post",
-                id="new-post-form",
-                cls="agent-brief-form",
+                cls="composer-controls-grid",
+            ),
+            cls="composer-controls",
+        ),
+        method="post",
+        action="/new-post",
+        id="new-post-form",
+        cls="creation-composer new-post-composer",
+    )
+    artifact_panel = Aside(
+        Div(
+            Div(Span("✦", cls="artifact-title-icon"), H2("Artifacts")),
+            Span("Waiting", cls="artifact-status"),
+            cls="creation-pane-head artifact-pane-head",
+        ),
+        Div(
+            Div(
+                Span("▧", cls="artifact-empty-icon"),
+                H2("Your work will appear here"),
+                P(
+                    "Draft copy, platform variants, generated images, and videos stay beside the chat."
+                ),
+                cls="artifact-empty",
             ),
             Div(
-                H2("Publish to"),
+                H3("Publish to"),
                 Div(
                     *(
                         account_options
                         or [
                             P(
-                                "Connect a social account to publish; generation can still create a draft.",
+                                "No social accounts connected yet. You can still create and save a draft.",
                                 cls="form-help",
                             )
                         ]
                     ),
-                    cls="account-options",
+                    cls="account-options artifact-account-options",
                 ),
-                H2("Model access", style="margin-top:22px"),
-                P(
-                    f"{ctx.workspace.default_model_provider.upper()} · {_model_gate_message(ctx, ctx.workspace.default_model_provider)}",
-                    cls="form-help",
+                Div(
+                    Span("Model", cls="artifact-meta-label"),
+                    Strong(ctx.workspace.default_model_provider.upper()),
+                    Small(_model_gate_message(ctx, ctx.workspace.default_model_provider)),
+                    A("Configure", href="/integrations#ai-models"),
+                    cls="artifact-model-card",
                 ),
-                A("Configure models", href="/integrations#ai-models", cls="btn small"),
-                cls="agent-context-panel",
+                cls="artifact-setup",
             ),
-            cls="agent-workbench new-agent-workbench",
+            cls="creation-artifact-body",
         ),
+        cls="creation-artifact-pane",
+    )
+    return Div(
+        flash(error, "error"),
+        Div(
+            Section(
+                Div(
+                    Div(H2("New post"), Small("Agentic creation workspace")),
+                    Span("READY", cls="mode-badge"),
+                    cls="creation-pane-head",
+                ),
+                Div(
+                    Div(
+                        Span("✦", cls="creation-welcome-icon"),
+                        H1("What should we create?"),
+                        P(
+                            "Chat with your marketing agents. Give them an idea, a goal, or a rough thought—they will generate, review, and prepare the post."
+                        ),
+                        cls="creation-welcome",
+                    ),
+                    cls="creation-message-scroll empty-conversation",
+                ),
+                composer,
+                cls="creation-chat-pane",
+            ),
+            artifact_panel,
+            cls="creation-workspace new-creation-workspace",
+        ),
+        cls="creation-page-shell",
     )
 
 
@@ -1059,7 +1133,7 @@ async def new_post(request, sess):
         return _app_page(
             ctx, "New Post", "/new-post", _new_post_form(ctx, sess, "Your session expired.")
         )
-    brief = str(form.get("brief") or "").strip()
+    brief = str(form.get("suggestion") or form.get("brief") or "").strip()
     try:
         if not brief:
             raise ValueError("Creative brief is required")
@@ -1172,11 +1246,101 @@ def _chat_page(
         media_items = (
             list(session.scalars(select(Media).where(Media.id.in_(media_ids)))) if media_ids else []
         )
-    chat_panel = Div(
+    suggestions = (
+        ("Sharper hook", "Rewrite this with a sharper opening hook and keep the claims factual."),
+        ("More concise", "Make every platform variant more concise without losing the core idea."),
+        ("New angle", "Create a fresh alternative angle for the same audience and goal."),
+        (
+            "Check tone",
+            "Review the tone, evidence, and call to action, then improve anything weak.",
+        ),
+    )
+    action_forms = []
+    if artifact and not completed:
+        action_forms.extend(
+            [
+                Form(
+                    csrf_input(sess),
+                    Input(type="hidden", name="kind", value="image"),
+                    Input(type="hidden", name="prompt", value=content.get("image_prompt", "")),
+                    Button("▧ Generate image", type="submit", cls="chat-action-chip"),
+                    method="post",
+                    action=f"/chats/{chat.id}/media",
+                ),
+                Form(
+                    csrf_input(sess),
+                    Input(type="hidden", name="kind", value="video"),
+                    Input(type="hidden", name="prompt", value=content.get("video_prompt", "")),
+                    Button("▶ Generate video", type="submit", cls="chat-action-chip"),
+                    method="post",
+                    action=f"/chats/{chat.id}/media",
+                ),
+            ]
+        )
+        if awaiting_approval:
+            action_forms.append(
+                Form(
+                    csrf_input(sess),
+                    Button("✓ Approve for posting", type="submit", cls="chat-action-chip primary"),
+                    method="post",
+                    action=f"/chats/{chat.id}/approve",
+                )
+            )
+        else:
+            action_forms.extend(
+                [
+                    Form(
+                        csrf_input(sess),
+                        Button(
+                            "Save draft",
+                            type="submit",
+                            name="delivery",
+                            value="draft",
+                            cls="chat-action-chip",
+                        ),
+                        method="post",
+                        action=f"/chats/{chat.id}/post",
+                    ),
+                    Form(
+                        csrf_input(sess),
+                        Input(
+                            type="datetime-local",
+                            name="scheduled_at",
+                            value=str(state.get("scheduled_at") or ""),
+                            aria_label="Schedule time",
+                        ),
+                        Button(
+                            "Schedule",
+                            type="submit",
+                            name="delivery",
+                            value="schedule",
+                            cls="chat-action-chip",
+                            disabled=True if not state.get("target_ids") else None,
+                        ),
+                        method="post",
+                        action=f"/chats/{chat.id}/post",
+                        cls="chat-schedule-action",
+                    ),
+                    Form(
+                        csrf_input(sess),
+                        Button(
+                            "Publish now",
+                            type="submit",
+                            name="delivery",
+                            value="now",
+                            cls="chat-action-chip primary",
+                            disabled=True if not state.get("target_ids") else None,
+                        ),
+                        method="post",
+                        action=f"/chats/{chat.id}/post",
+                    ),
+                ]
+            )
+    chat_panel = Section(
         Div(
-            H2("Creation chat"),
+            Div(H2(chat.title), Small("Creation chat")),
             Span(chat.workflow_mode.value.upper(), cls=f"mode-badge {chat.workflow_mode.value}"),
-            cls="card-head",
+            cls="creation-pane-head",
         ),
         Div(
             *[
@@ -1191,7 +1355,7 @@ def _chat_page(
                 )
                 for item in messages
             ],
-            cls="agent-chat-messages",
+            cls="creation-message-scroll agent-chat-messages",
         ),
         Details(
             Summary(f"Agent activity · {len(events)} events"),
@@ -1205,173 +1369,142 @@ def _chat_page(
             cls="agent-trace",
             open=chat.stage in {WorkflowStage.generate, WorkflowStage.failed},
         ),
-        Form(
-            csrf_input(sess),
-            Textarea(
-                name="message",
-                placeholder="Refine the angle, tone, evidence, or media direction…",
-                required=True,
-            ),
-            Button("Send →", type="submit", cls="btn primary"),
-            method="post",
-            action=f"/chats/{chat.id}/messages",
-            cls="agent-followup",
-        )
-        if chat.stage not in {WorkflowStage.complete}
-        else "",
-        cls="card agent-chat-panel",
+        (
+            Div(
+                Div(*action_forms, cls="chat-action-row") if action_forms else "",
+                Form(
+                    csrf_input(sess),
+                    Div(
+                        Textarea(
+                            name="message",
+                            placeholder="Ask the agents to refine, rethink, or repurpose this post…",
+                            rows="3",
+                        ),
+                        Button("↑", type="submit", cls="chat-send", title="Send message"),
+                        cls="chat-composer-box",
+                    ),
+                    Div(
+                        *[
+                            Button(
+                                Strong(label),
+                                type="submit",
+                                name="suggestion",
+                                value=prompt,
+                                cls="prompt-suggestion-card compact",
+                            )
+                            for label, prompt in suggestions
+                        ],
+                        cls="prompt-suggestions",
+                    ),
+                    method="post",
+                    action=f"/chats/{chat.id}/messages",
+                    cls="creation-composer",
+                ),
+                cls="creation-composer-dock",
+            )
+            if not completed
+            else Div(
+                A("Open completed post →", href=f"/posts/{chat.post_id}", cls="btn primary"),
+                cls="creation-complete-dock",
+            )
+        ),
+        cls="creation-chat-pane",
     )
     if artifact:
         review = content.get("review") if isinstance(content.get("review"), dict) else {}
-        artifact_panel = Div(
+        artifact_panel = Aside(
             Div(
-                Div(H2("Post artifact"), Small(f"{artifact.provider}:{artifact.model_name}")),
-                Span(artifact.status.value.upper(), cls="mode-badge"),
-                cls="card-head",
-            ),
-            Form(
-                csrf_input(sess),
                 Div(
-                    Label("Master post"),
-                    Textarea(
-                        content.get("text", ""),
-                        name="text",
-                        required=True,
-                        readonly=True if completed else None,
-                    ),
-                    cls="field",
+                    Span("✦", cls="artifact-title-icon"),
+                    Div(H2("Artifacts"), Small(f"{artifact.provider}:{artifact.model_name}")),
+                ),
+                Span(artifact.status.value.upper(), cls="artifact-status"),
+                cls="creation-pane-head artifact-pane-head",
+            ),
+            Div(
+                Div(
+                    Span("MASTER POST", cls="artifact-meta-label"),
+                    P(str(content.get("text") or ""), cls="artifact-copy"),
+                    cls="artifact-card primary-artifact",
                 ),
                 *[
                     Div(
-                        Label(f"{PLATFORM_NAMES.get(platform, platform.title())} variant"),
-                        Textarea(
-                            value,
-                            name=f"variant_{platform}",
-                            readonly=True if completed else None,
+                        Div(
+                            Span(
+                                PLATFORM_MARKS.get(platform, "?"),
+                                cls=f"platform-mark {platform}",
+                            ),
+                            Strong(f"{PLATFORM_NAMES.get(platform, platform.title())} variant"),
+                            cls="artifact-card-title",
                         ),
-                        cls="field compact",
+                        P(str(value), cls="artifact-copy variant-copy"),
+                        cls="artifact-card",
                     )
                     for platform, value in variants.items()
                 ],
                 Div(
-                    H3("Editorial review"),
+                    Div(
+                        Span("✓", cls="review-check"),
+                        H3("Editorial review"),
+                        cls="artifact-card-title",
+                    ),
                     P(str(review.get("summary") or "Ready for review.")),
                     Ul(*[Li(str(item)) for item in review.get("risks", [])])
                     if review.get("risks")
                     else "",
-                    cls="review-box",
+                    cls="artifact-card review-box",
                 ),
-                (
+                Div(
+                    H3("Generated media"),
                     Div(
-                        Label("Schedule time"),
-                        Input(
-                            type="datetime-local",
-                            name="scheduled_at",
-                            value=str(state.get("scheduled_at") or ""),
-                        ),
-                        cls="field",
-                    )
-                    if not completed and not awaiting_approval
-                    else ""
-                ),
-                (
-                    Div(
-                        (
-                            Button("Approve for posting →", type="submit", cls="btn primary")
-                            if awaiting_approval
-                            else Div(
-                                Button(
-                                    "Save draft",
-                                    type="submit",
-                                    name="delivery",
-                                    value="draft",
-                                    cls="btn",
+                        *[
+                            Div(
+                                (
+                                    NotStr(
+                                        f'<img src="{media_storage().url(item.storage_key)}" alt="Generated media">'
+                                    )
+                                    if item.mime_type.startswith("image/")
+                                    else NotStr(
+                                        f'<video controls preload="metadata" src="{media_storage().url(item.storage_key)}"></video>'
+                                    )
                                 ),
-                                Button(
-                                    "Schedule",
-                                    type="submit",
-                                    name="delivery",
-                                    value="schedule",
-                                    cls="btn",
-                                    disabled=True if not state.get("target_ids") else None,
-                                ),
-                                Button(
-                                    "Publish now",
-                                    type="submit",
-                                    name="delivery",
-                                    value="now",
-                                    cls="btn primary",
-                                    disabled=True if not state.get("target_ids") else None,
-                                ),
-                                cls="form-actions",
+                                Small(item.filename),
+                                cls="generated-media-item",
                             )
-                        ),
-                        cls="form-actions",
-                    )
-                    if not completed
-                    else Div(
-                        A("View post →", href=f"/posts/{chat.post_id}", cls="btn primary"),
-                        cls="form-actions",
-                    )
+                            for item in media_items
+                        ],
+                        cls="generated-media-strip",
+                    ),
+                    cls="artifact-media-section",
+                )
+                if media_items
+                else Div(
+                    Span("▧", cls="artifact-empty-icon small"),
+                    P("Generated images and videos will appear here."),
+                    cls="artifact-media-empty",
                 ),
-                method="post",
-                action=(
-                    f"/chats/{chat.id}/approve" if awaiting_approval else f"/chats/{chat.id}/post"
-                ),
+                cls="creation-artifact-body",
             ),
-            Div(
-                Form(
-                    csrf_input(sess),
-                    Input(type="hidden", name="kind", value="image"),
-                    Input(type="hidden", name="prompt", value=content.get("image_prompt", "")),
-                    Button("Generate image", type="submit", cls="btn"),
-                    method="post",
-                    action=f"/chats/{chat.id}/media",
-                ),
-                Form(
-                    csrf_input(sess),
-                    Input(type="hidden", name="kind", value="video"),
-                    Input(type="hidden", name="prompt", value=content.get("video_prompt", "")),
-                    Button("Generate video", type="submit", cls="btn"),
-                    method="post",
-                    action=f"/chats/{chat.id}/media",
-                ),
-                cls="form-actions left media-actions",
-            )
-            if not completed
-            else "",
-            Div(
-                *[
-                    Div(
-                        (
-                            NotStr(
-                                f'<img src="{media_storage().url(item.storage_key)}" alt="Generated media">'
-                            )
-                            if item.mime_type.startswith("image/")
-                            else NotStr(
-                                f'<video controls preload="metadata" src="{media_storage().url(item.storage_key)}"></video>'
-                            )
-                        ),
-                        Small(item.filename),
-                        cls="generated-media-item",
-                    )
-                    for item in media_items
-                ],
-                cls="generated-media-strip",
-            )
-            if media_items
-            else "",
-            cls="card agent-artifact-panel",
+            cls="creation-artifact-pane",
         )
     else:
-        artifact_panel = empty_state(
-            "✦", "No artifact yet", "Send a refinement or start a new post."
+        artifact_panel = Aside(
+            Div(
+                Div(Span("✦", cls="artifact-title-icon"), H2("Artifacts")), cls="creation-pane-head"
+            ),
+            Div(
+                Span("▧", cls="artifact-empty-icon"),
+                H2("No artifact yet"),
+                P("Keep chatting and the generated work will appear here."),
+                cls="artifact-empty",
+            ),
+            cls="creation-artifact-pane",
         )
     return Div(
-        _workflow_steps(chat.stage),
         flash(message),
         flash(error, "error"),
-        Div(chat_panel, artifact_panel, cls="agent-workbench"),
+        Div(chat_panel, artifact_panel, cls="creation-workspace"),
+        cls="creation-page-shell",
     )
 
 
@@ -1407,7 +1540,7 @@ async def chat_message(chat_id: str, request, sess):
     form = await request.form()
     if not verify_csrf(sess, form.get("csrf")):
         return Response("Forbidden", status_code=403)
-    value = str(form.get("message") or "").strip()
+    value = str(form.get("suggestion") or form.get("message") or "").strip()
     if not value:
         return RedirectResponse(f"/chats/{chat.id}?error=Message+is+required", status_code=303)
     with session_scope() as session:
@@ -1461,12 +1594,13 @@ async def _deliver_chat(chat_id: uuid.UUID, ctx: PageContext, *, delivery: str, 
             raise ValueError("Approve the current artifact before posting")
         content = dict(artifact.content)
         if form is not None:
-            content["text"] = str(form.get("text") or "").strip()
+            if form.get("text") is not None:
+                content["text"] = str(form.get("text") or "").strip()
             variants = dict(content.get("variants") or {})
             for platform in list(variants):
-                variants[platform] = str(
-                    form.get(f"variant_{platform}") or variants[platform]
-                ).strip()
+                submitted = form.get(f"variant_{platform}")
+                if submitted is not None:
+                    variants[platform] = str(submitted).strip()
             content["variants"] = variants
             artifact.content = content
         state = dict(chat.state or {})
@@ -1512,6 +1646,19 @@ async def _deliver_chat(chat_id: uuid.UUID, ctx: PageContext, *, delivery: str, 
             "Post handed to the deterministic publishing pipeline",
             delivery=delivery,
         )
+        delivery_label = {
+            "draft": "I saved the approved content as a draft.",
+            "schedule": "I scheduled the approved post for delivery.",
+            "now": "I handed the approved post to the publishing pipeline.",
+        }.get(delivery, "I completed the post delivery step.")
+        session.add(
+            ChatMessage(
+                chat_session_id=chat.id,
+                role=ChatRole.assistant,
+                agent_slug="publisher",
+                content=delivery_label,
+            )
+        )
         post_id = post.id
         should_publish = (
             delivery == "now" and bool(target_ids) and post.status == PostStatus.scheduled
@@ -1526,10 +1673,13 @@ async def _deliver_chat(chat_id: uuid.UUID, ctx: PageContext, *, delivery: str, 
 
 def _content_from_review_form(artifact: ContentArtifact, form) -> dict:
     content = dict(artifact.content)
-    content["text"] = str(form.get("text") or "").strip()
+    if form.get("text") is not None:
+        content["text"] = str(form.get("text") or "").strip()
     variants = dict(content.get("variants") or {})
     for platform in list(variants):
-        variants[platform] = str(form.get(f"variant_{platform}") or "").strip()
+        submitted = form.get(f"variant_{platform}")
+        if submitted is not None:
+            variants[platform] = str(submitted).strip()
     content["variants"] = variants
     return content
 
@@ -1575,6 +1725,14 @@ async def chat_approve(chat_id: str, request, sess):
                 "approved",
                 "Content approved for posting",
                 artifact_version=current.version,
+            )
+            session.add(
+                ChatMessage(
+                    chat_session_id=row.id,
+                    role=ChatRole.assistant,
+                    agent_slug="editorial-review",
+                    content="Approved. The artifact is locked and ready to save, schedule, or publish.",
+                )
             )
         return RedirectResponse(f"/chats/{chat.id}?saved=approved", status_code=303)
     except Exception as exc:  # noqa: BLE001

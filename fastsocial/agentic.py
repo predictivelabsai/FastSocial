@@ -345,6 +345,14 @@ async def generate_media_for_chat(
                 "completed",
                 f"Generated {kind} saved to the media library",
             )
+            session.add(
+                ChatMessage(
+                    chat_session_id=chat.id,
+                    role=ChatRole.assistant,
+                    agent_slug="media-director",
+                    content=f"I generated a new {kind} and added it to the artifact panel.",
+                )
+            )
             return media.id
     except Exception as exc:
         with session_scope() as session:
