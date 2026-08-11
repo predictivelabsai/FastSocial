@@ -11,15 +11,17 @@ Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateway
 - FastVC-style left navigation and a dedicated integration status page
 - Direct, Arcade MCP, and Composio MCP connection paths per social account
 - Encrypted credentials and OAuth tokens
-- Multi-account composer, drafts, scheduling, and month/week/list planner views
+- Multi-account composer, drafts, scheduling, and month/week/list planner views with drag rescheduling
+- Evergreen Autolists with daily, weekly, or monthly round-robin publishing
 - Best-time recommendations derived from the latest post-performance snapshots
 - Private local or Cloudflare R2 media library
 - Idempotent publishing worker with per-target retry state
 - Post/account metrics, server-rendered SVG analytics, and CSV export
 - Competitor profiles with historical growth/engagement snapshots and export
-- Unified brand reports with saved delivery schedules
+- Unified brand reports with printable/R2 artifacts, scheduled runs, and optional Postmark delivery
+- Meta, Google, and TikTok Ads campaign snapshots with spend, CPC, conversion, ROAS, and CSV export
 - Public SmartLinks with themes plus live view and click measurement
-- Tenant-safe unified inbox foundation for provider message/comment collectors
+- Tenant-safe unified inbox with assignment, priority, resolution, saved replies, and provider dispatch
 - Personal publishing without approval; optional team approval workflow
 - Agentic Create / Generate → Review → Post chats with an optional autonomous YOLO mode
 - 49 editable, versioned marketing skills vendored from Corey's Marketing Skills
@@ -28,7 +30,9 @@ Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateway
 - PostgreSQL migrations, Docker, local tests, and Coolify CI/CD scaffolding
 
 The application and all business workflows are Python. The UI is rendered with FastHTML and HTMX;
-the Skills WYSIWYG uses a small isolated Quill adapter and has a Markdown fallback.
+the Skills WYSIWYG uses a small isolated Quill adapter and has a Markdown fallback. Planner drag and
+drop is a progressively enhanced, route-specific script; the underlying reschedule flow remains a
+server-owned Python operation.
 
 ## Local setup
 

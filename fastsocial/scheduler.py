@@ -6,7 +6,14 @@ from functools import lru_cache
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from fastsocial.config import settings
-from fastsocial.services import check_account_health, collect_metrics, publish_due_posts, run_async
+from fastsocial.reporting import run_due_reports
+from fastsocial.services import (
+    check_account_health,
+    collect_metrics,
+    process_due_autolists,
+    publish_due_posts,
+    run_async,
+)
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +26,22 @@ def scheduler() -> BackgroundScheduler:
         "interval",
         seconds=15,
         id="publish_due_posts",
+        max_instances=1,
+        coalesce=True,
+    )
+    value.add_job(
+        lambda: run_async(process_due_autolists()),
+        "interval",
+        seconds=60,
+        id="process_due_autolists",
+        max_instances=1,
+        coalesce=True,
+    )
+    value.add_job(
+        lambda: run_async(run_due_reports()),
+        "interval",
+        minutes=15,
+        id="run_due_reports",
         max_instances=1,
         coalesce=True,
     )

@@ -428,6 +428,10 @@ class InboxConversation(Base):
     participant_name: Mapped[str] = mapped_column(String(255), default="")
     participant_handle: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(40), default="unread", index=True)
+    priority: Mapped[str] = mapped_column(String(20), default="normal", index=True)
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
     last_message_preview: Mapped[str] = mapped_column(Text, default="")
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     conversation_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -453,10 +457,33 @@ class InboxMessage(Base):
     direction: Mapped[str] = mapped_column(String(20), default="inbound")
     sender_name: Mapped[str] = mapped_column(String(255), default="")
     body: Mapped[str] = mapped_column(Text)
+    delivery_status: Mapped[str] = mapped_column(String(40), default="received", index=True)
+    error_message: Mapped[str] = mapped_column(Text, default="")
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     message_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     conversation: Mapped[InboxConversation] = relationship(back_populates="messages")
+
+
+class SavedReply(Base):
+    __tablename__ = "saved_replies"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "shortcut"),
+        Index("ix_saved_replies_workspace_created", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(160))
+    shortcut: Mapped[str] = mapped_column(String(80))
+    body: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class ReportSchedule(Base):
@@ -471,6 +498,8 @@ class ReportSchedule(Base):
     frequency: Mapped[str] = mapped_column(String(40), default="monthly")
     recipients: Mapped[list[str]] = mapped_column(JSON, default=list)
     sections: Mapped[list[str]] = mapped_column(JSON, default=list)
+    report_days: Mapped[int] = mapped_column(Integer, default=30)
+    output_format: Mapped[str] = mapped_column(String(20), default="html")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -479,6 +508,102 @@ class ReportSchedule(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class ReportRun(Base):
+    __tablename__ = "report_runs"
+    __table_args__ = (Index("ix_report_runs_schedule_created", "schedule_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("report_schedules.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="running", index=True)
+    storage_key: Mapped[str] = mapped_column(Text, default="")
+    recipients: Mapped[list[str]] = mapped_column(JSON, default=list)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContentAutolist(Base):
+    __tablename__ = "content_autolists"
+    __table_args__ = (Index("ix_autolists_workspace_due", "workspace_id", "active", "next_run_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    cadence: Mapped[str] = mapped_column(String(30), default="weekly")
+    publish_time: Mapped[str] = mapped_column(String(5), default="09:00")
+    timezone: Mapped[str] = mapped_column(String(64), default="Europe/Tallinn")
+    weekdays: Mapped[list[int]] = mapped_column(JSON, default=list)
+    target_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    current_index: Mapped[int] = mapped_column(Integer, default=0)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    items: Mapped[list[AutolistItem]] = relationship(
+        back_populates="autolist", cascade="all, delete-orphan", order_by="AutolistItem.position"
+    )
+
+
+class AutolistItem(Base):
+    __tablename__ = "autolist_items"
+    __table_args__ = (Index("ix_autolist_items_list_position", "autolist_id", "position"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    autolist_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_autolists.id", ondelete="CASCADE"), index=True
+    )
+    text: Mapped[str] = mapped_column(Text)
+    media_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    autolist: Mapped[ContentAutolist] = relationship(back_populates="items")
+
+
+class AdCampaignDaily(Base):
+    __tablename__ = "ad_campaigns_daily"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "platform", "external_campaign_id", "metric_date"),
+        Index("ix_ads_workspace_date", "workspace_id", "metric_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    social_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("social_accounts.id", ondelete="SET NULL"), index=True
+    )
+    platform: Mapped[str] = mapped_column(String(40), index=True)
+    external_campaign_id: Mapped[str] = mapped_column(String(255))
+    campaign_name: Mapped[str] = mapped_column(String(255))
+    metric_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="active")
+    currency: Mapped[str] = mapped_column(String(3), default="EUR")
+    spend: Mapped[float] = mapped_column(Float, default=0)
+    impressions: Mapped[int] = mapped_column(BigInteger, default=0)
+    clicks: Mapped[int] = mapped_column(BigInteger, default=0)
+    conversions: Mapped[float] = mapped_column(Float, default=0)
+    revenue: Mapped[float] = mapped_column(Float, default=0)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class SmartLinkPage(Base):

@@ -86,11 +86,13 @@ from fastsocial.model_provider import (
 from fastsocial.models import (
     AccountMetricDaily,
     AccountStatus,
+    AdCampaignDaily,
     AgentEvent,
     AIProviderCredential,
     ApprovalStatus,
     ArtifactStatus,
     AuditLog,
+    AutolistItem,
     ChatMessage,
     ChatRole,
     ChatSession,
@@ -98,6 +100,7 @@ from fastsocial.models import (
     CompetitorProfile,
     ConnectionProvider,
     ContentArtifact,
+    ContentAutolist,
     InboxConversation,
     Media,
     ModelProfile,
@@ -106,7 +109,9 @@ from fastsocial.models import (
     PostMetric,
     PostStatus,
     PostTarget,
+    ReportRun,
     ReportSchedule,
+    SavedReply,
     SkillDefinition,
     SkillVersionStatus,
     SmartLinkItem,
@@ -122,6 +127,7 @@ from fastsocial.models import (
     WorkspaceSkillVersion,
     utcnow,
 )
+from fastsocial.reporting import execute_report_schedule, render_report_html, report_summary
 from fastsocial.security import (
     csrf_token,
     encrypt_text,
@@ -135,7 +141,10 @@ from fastsocial.services import (
     create_post,
     get_or_create_user,
     membership_for,
+    next_autolist_run,
+    process_due_autolists,
     publish_post,
+    send_inbox_reply,
     slugify,
     store_media,
     validate_content,
@@ -2269,10 +2278,13 @@ def calendar_page(sess, year: int = 0, month: int = 0, view: str = "month", focu
                                 ),
                                 href=f"/posts/{item.id}",
                                 cls="calendar-post",
+                                draggable="true",
+                                data_post_id=str(item.id),
                             )
                             for item in by_date.get(day, [])
                         ],
                         cls=f"calendar-day{' muted' if day.month != month else ''}",
+                        data_date=day.isoformat(),
                     )
                 )
         planner_view = Div(
@@ -2314,11 +2326,14 @@ def calendar_page(sess, year: int = 0, month: int = 0, view: str = "month", focu
                             P((item.content.get("text", "") or "Untitled")[:70]),
                             href=f"/posts/{item.id}",
                             cls="week-post",
+                            draggable="true",
+                            data_post_id=str(item.id),
                         )
                         for item in by_date.get(day, [])
                     ],
                     P("No posts", cls="week-empty") if not by_date.get(day) else "",
                     cls=f"week-day{' today' if day == today else ''}",
+                    data_date=day.isoformat(),
                 )
                 for day in days
             ],
@@ -2430,8 +2445,340 @@ def calendar_page(sess, year: int = 0, month: int = 0, view: str = "month", focu
             controls,
         ),
         view_tabs,
-        Div(planner_view, best_time_panel, cls="planner-layout"),
+        Div(
+            planner_view,
+            best_time_panel,
+            cls="planner-layout planner-drop-root",
+            data_csrf=csrf_token(sess),
+        ),
+        Script(src="/static/planner.js", defer=True),
     )
+
+
+@rt("/api/planner/reschedule", methods=["POST"])
+async def planner_reschedule(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        post_id = uuid.UUID(str(form.get("post_id") or ""))
+        target_date = date.fromisoformat(str(form.get("target_date") or ""))
+    except ValueError:
+        return Response("Invalid post or date", status_code=400)
+    with session_scope() as session:
+        post = session.scalar(
+            select(Post)
+            .where(Post.id == post_id, Post.workspace_id == ctx.workspace.id)
+            .options(selectinload(Post.targets))
+        )
+        if not post:
+            return Response("Not found", status_code=404)
+        if post.status in {PostStatus.published, PostStatus.cancelled}:
+            return Response("Post cannot be rescheduled", status_code=409)
+        zone = ZoneInfo(ctx.workspace.timezone)
+        current = post.scheduled_at or utcnow()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        local = current.astimezone(zone)
+        post.scheduled_at = local.replace(
+            year=target_date.year, month=target_date.month, day=target_date.day
+        ).astimezone(UTC)
+        post.status = PostStatus.scheduled if post.targets else PostStatus.draft
+        for target in post.targets:
+            if target.status != TargetStatus.published:
+                target.status = TargetStatus.pending
+                target.next_retry_at = None
+        audit(
+            session,
+            ctx.workspace.id,
+            ctx.user.id,
+            "post.rescheduled.drag",
+            post,
+            {"target_date": target_date.isoformat()},
+        )
+    return Response(status_code=204, headers={"HX-Refresh": "true"})
+
+
+@rt("/autolists", methods=["GET"])
+def autolists_page(sess, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    with session_scope() as session:
+        lists = list(
+            session.scalars(
+                select(ContentAutolist)
+                .where(ContentAutolist.workspace_id == ctx.workspace.id)
+                .options(selectinload(ContentAutolist.items))
+                .order_by(desc(ContentAutolist.created_at))
+            )
+        )
+    cards = []
+    for autolist in lists:
+        target_names = [
+            account.display_name or account.username
+            for account in ctx.accounts
+            if str(account.id) in autolist.target_ids
+        ]
+        item_rows = [
+            Div(
+                Div(Strong(f"#{index + 1}"), P(item.text)),
+                Small(f"Used {item.used_count}×"),
+                cls="autolist-item",
+            )
+            for index, item in enumerate(autolist.items)
+        ]
+        cards.append(
+            Div(
+                Div(
+                    Div(
+                        H2(autolist.name),
+                        Small(
+                            f"{autolist.cadence.title()} at {autolist.publish_time} · "
+                            + (", ".join(target_names) or "No destinations")
+                        ),
+                    ),
+                    Span("ACTIVE" if autolist.active else "PAUSED", cls="mode-badge"),
+                    cls="card-head",
+                ),
+                Div(*item_rows, cls="autolist-items")
+                if item_rows
+                else P(
+                    "Add evergreen posts below to activate this list.", cls="card-body form-help"
+                ),
+                Div(
+                    Form(
+                        csrf_input(sess),
+                        Textarea(
+                            name="text",
+                            placeholder="Write an evergreen post to rotate…",
+                            required=True,
+                            rows="3",
+                        ),
+                        Button("Add content", type="submit", cls="btn primary small"),
+                        method="post",
+                        action=f"/autolists/{autolist.id}/items",
+                    ),
+                    Div(
+                        Form(
+                            csrf_input(sess),
+                            Button(
+                                "Pause" if autolist.active else "Resume",
+                                type="submit",
+                                cls="btn small",
+                            ),
+                            method="post",
+                            action=f"/autolists/{autolist.id}/toggle",
+                        ),
+                        Form(
+                            csrf_input(sess),
+                            Button("Run now", type="submit", cls="btn small"),
+                            method="post",
+                            action=f"/autolists/{autolist.id}/run",
+                        ),
+                        cls="form-actions",
+                    ),
+                    cls="autolist-controls",
+                ),
+                Small(
+                    f"Next run: {_format_datetime(autolist.next_run_at, ctx.workspace.timezone)}",
+                    cls="autolist-next",
+                ),
+                cls="card autolist-card",
+            )
+        )
+    create_form = Form(
+        csrf_input(sess),
+        Div(
+            Div(
+                Label("List name"),
+                Input(name="name", placeholder="Evergreen insights", required=True),
+                cls="field",
+            ),
+            Div(
+                Label("Cadence"),
+                Select(
+                    Option("Daily", value="daily"),
+                    Option("Weekly", value="weekly", selected=True),
+                    Option("Monthly", value="monthly"),
+                    name="cadence",
+                ),
+                cls="field",
+            ),
+            Div(
+                Label("Publish time"),
+                Input(type="time", name="publish_time", value="09:00", required=True),
+                cls="field",
+            ),
+            cls="autolist-create-grid",
+        ),
+        Div(
+            Label("Destinations"),
+            Div(
+                *[
+                    Label(
+                        Input(type="checkbox", name="target_ids", value=str(account.id)),
+                        f" {account.display_name or account.username} ({PLATFORM_NAMES.get(account.platform, account.platform.title())})",
+                        cls="check-row",
+                    )
+                    for account in ctx.accounts
+                ],
+                cls="target-checks",
+            ),
+            cls="field",
+        ),
+        Button("Create autolist", type="submit", cls="btn primary"),
+        method="post",
+        action="/autolists",
+        cls="card autolist-create",
+    )
+    return _app_page(
+        ctx,
+        "Autolists",
+        "/autolists",
+        flash("Autolist updated." if saved else ""),
+        flash(error, "error"),
+        page_intro(
+            "EVERGREEN LIBRARY",
+            "Keep proven content in motion.",
+            "Rotate a reusable post library on a daily, weekly, or monthly cadence. Every generated post remains visible in Planner.",
+            A("Open Planner", href="/calendar", cls="btn"),
+        ),
+        Div(*cards, cls="autolist-grid") if cards else "",
+        Div(H2("Create an autolist"), cls="section-heading"),
+        create_form,
+    )
+
+
+@rt("/autolists", methods=["POST"])
+async def autolist_create(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        name = str(form.get("name") or "").strip()
+        cadence = str(form.get("cadence") or "weekly")
+        publish_time = str(form.get("publish_time") or "09:00")
+        target_ids = [uuid.UUID(value) for value in form.getlist("target_ids")]
+        valid_targets = {account.id for account in ctx.accounts}
+        if not name or cadence not in {"daily", "weekly", "monthly"}:
+            raise ValueError("Enter a name and valid cadence")
+        if not target_ids or not set(target_ids).issubset(valid_targets):
+            raise ValueError("Choose at least one connected destination")
+        datetime.strptime(publish_time, "%H:%M")
+        with session_scope() as session:
+            autolist = ContentAutolist(
+                workspace_id=ctx.workspace.id,
+                name=name,
+                cadence=cadence,
+                publish_time=publish_time,
+                timezone=ctx.workspace.timezone,
+                target_ids=[str(value) for value in target_ids],
+                next_run_at=next_autolist_run(
+                    cadence=cadence,
+                    publish_time=publish_time,
+                    timezone=ctx.workspace.timezone,
+                ),
+                created_by=ctx.user.id,
+            )
+            session.add(autolist)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "autolist.created", autolist)
+        return RedirectResponse("/autolists?saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/autolists?error={quote_plus(str(exc))}", status_code=303)
+
+
+def _workspace_autolist(session, autolist_id: str, workspace_id: uuid.UUID):
+    try:
+        parsed = uuid.UUID(autolist_id)
+    except ValueError:
+        return None
+    return session.scalar(
+        select(ContentAutolist)
+        .where(ContentAutolist.id == parsed, ContentAutolist.workspace_id == workspace_id)
+        .options(selectinload(ContentAutolist.items))
+    )
+
+
+@rt("/autolists/{autolist_id}/items", methods=["POST"])
+async def autolist_item_add(autolist_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    text = str(form.get("text") or "").strip()
+    if not text:
+        return RedirectResponse("/autolists?error=Post+text+is+required", status_code=303)
+    with session_scope() as session:
+        autolist = _workspace_autolist(session, autolist_id, ctx.workspace.id)
+        if not autolist:
+            return Response("Not found", status_code=404)
+        item = AutolistItem(autolist_id=autolist.id, text=text, position=len(autolist.items))
+        session.add(item)
+        audit(session, ctx.workspace.id, ctx.user.id, "autolist.item.created", item)
+    return RedirectResponse("/autolists?saved=1", status_code=303)
+
+
+@rt("/autolists/{autolist_id}/toggle", methods=["POST"])
+async def autolist_toggle(autolist_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    with session_scope() as session:
+        autolist = _workspace_autolist(session, autolist_id, ctx.workspace.id)
+        if not autolist:
+            return Response("Not found", status_code=404)
+        autolist.active = not autolist.active
+        if autolist.active and not autolist.next_run_at:
+            autolist.next_run_at = next_autolist_run(
+                cadence=autolist.cadence,
+                publish_time=autolist.publish_time,
+                timezone=autolist.timezone,
+            )
+        audit(session, ctx.workspace.id, ctx.user.id, "autolist.toggled", autolist)
+    return RedirectResponse("/autolists?saved=1", status_code=303)
+
+
+@rt("/autolists/{autolist_id}/run", methods=["POST"])
+async def autolist_run_now(autolist_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    with session_scope() as session:
+        autolist = _workspace_autolist(session, autolist_id, ctx.workspace.id)
+        if not autolist:
+            return Response("Not found", status_code=404)
+        if not autolist.items:
+            return RedirectResponse("/autolists?error=Add+content+before+running", status_code=303)
+        autolist.active = True
+        autolist.next_run_at = utcnow()
+    await process_due_autolists()
+    return RedirectResponse("/autolists?saved=1", status_code=303)
 
 
 @rt("/skills")
@@ -4136,6 +4483,271 @@ def _report_data(workspace_id: uuid.UUID, days: int = 30) -> dict:
     }
 
 
+AD_PLATFORMS = ("meta", "google", "tiktok")
+
+
+@rt("/ads")
+def ads_page(sess, days: int = 30, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    days = days if days in {7, 30, 90, 365} else 30
+    since = date.today() - timedelta(days=days)
+    with session_scope() as session:
+        rows = list(
+            session.scalars(
+                select(AdCampaignDaily)
+                .where(
+                    AdCampaignDaily.workspace_id == ctx.workspace.id,
+                    AdCampaignDaily.metric_date >= since,
+                )
+                .order_by(desc(AdCampaignDaily.metric_date), AdCampaignDaily.campaign_name)
+            )
+        )
+    spend = sum(item.spend for item in rows)
+    impressions = sum(item.impressions for item in rows)
+    clicks = sum(item.clicks for item in rows)
+    conversions = sum(item.conversions for item in rows)
+    revenue = sum(item.revenue for item in rows)
+    currency = rows[0].currency if rows else "EUR"
+    table_rows = [
+        Tr(
+            Td(platform_pill(item.platform, item.platform.title())),
+            Td(item.campaign_name),
+            Td(item.metric_date.isoformat()),
+            Td(f"{item.spend:,.2f} {item.currency}"),
+            Td(f"{item.impressions:,}"),
+            Td(f"{item.clicks:,}"),
+            Td(f"{item.conversions:,.1f}"),
+            Td(f"{(item.revenue / item.spend):.2f}×" if item.spend else "—"),
+        )
+        for item in rows
+    ]
+    import_form = Form(
+        csrf_input(sess),
+        Div(
+            Div(
+                Label("Ad network"),
+                Select(
+                    *[Option(value.title(), value=value) for value in AD_PLATFORMS], name="platform"
+                ),
+                cls="field",
+            ),
+            Div(Label("Campaign ID"), Input(name="campaign_id", required=True), cls="field"),
+            Div(Label("Campaign name"), Input(name="campaign_name", required=True), cls="field"),
+            Div(
+                Label("Date"),
+                Input(
+                    type="date", name="metric_date", value=date.today().isoformat(), required=True
+                ),
+                cls="field",
+            ),
+            Div(
+                Label("Currency"),
+                Input(name="currency", value="EUR", maxlength="3", required=True),
+                cls="field",
+            ),
+            Div(
+                Label("Spend"),
+                Input(type="number", name="spend", min="0", step="0.01", value="0"),
+                cls="field",
+            ),
+            Div(
+                Label("Impressions"),
+                Input(type="number", name="impressions", min="0", value="0"),
+                cls="field",
+            ),
+            Div(
+                Label("Clicks"),
+                Input(type="number", name="clicks", min="0", value="0"),
+                cls="field",
+            ),
+            Div(
+                Label("Conversions"),
+                Input(type="number", name="conversions", min="0", step="0.01", value="0"),
+                cls="field",
+            ),
+            Div(
+                Label("Revenue"),
+                Input(type="number", name="revenue", min="0", step="0.01", value="0"),
+                cls="field",
+            ),
+            cls="ads-import-grid",
+        ),
+        Button("Save campaign snapshot", type="submit", cls="btn primary"),
+        method="post",
+        action="/ads/import",
+        cls="card ads-import-form",
+    )
+    return _app_page(
+        ctx,
+        "Ads",
+        "/ads",
+        flash("Campaign snapshot saved." if saved else ""),
+        flash(error, "error"),
+        page_intro(
+            "PAID + ORGANIC",
+            "Campaign performance in context.",
+            "Unify Meta, Google, and TikTok spend, traffic, conversion, and return metrics beside organic reporting.",
+            Div(
+                *[
+                    A(f"{value}d", href=f"/ads?days={value}", cls="btn small")
+                    for value in (7, 30, 90, 365)
+                ],
+                A("Export CSV", href=f"/ads/export.csv?days={days}", cls="btn primary"),
+                cls="report-actions",
+            ),
+        ),
+        Div(
+            stat_card("Spend", f"{spend:,.2f} {currency}"),
+            stat_card("Impressions", f"{impressions:,}"),
+            stat_card("CPC", f"{(spend / clicks):.2f} {currency}" if clicks else "—"),
+            stat_card(
+                "ROAS",
+                f"{(revenue / spend):.2f}×" if spend else "—",
+                f"{conversions:,.1f} conversions",
+            ),
+            cls="stats-grid",
+        ),
+        Div(
+            Table(
+                Thead(
+                    Tr(
+                        Th("Network"),
+                        Th("Campaign"),
+                        Th("Date"),
+                        Th("Spend"),
+                        Th("Impressions"),
+                        Th("Clicks"),
+                        Th("Conversions"),
+                        Th("ROAS"),
+                    )
+                ),
+                Tbody(*table_rows),
+            ),
+            cls="card table-wrap",
+        )
+        if table_rows
+        else empty_state(
+            "◈",
+            "No paid media data yet",
+            "Import a snapshot below or connect a provider collector.",
+        ),
+        Div(H2("Add campaign data"), cls="section-heading"),
+        import_form,
+    )
+
+
+@rt("/ads/import", methods=["POST"])
+async def ads_import(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        platform = str(form.get("platform") or "")
+        campaign_id = str(form.get("campaign_id") or "").strip()
+        campaign_name = str(form.get("campaign_name") or "").strip()
+        metric_date = date.fromisoformat(str(form.get("metric_date") or ""))
+        if platform not in AD_PLATFORMS or not campaign_id or not campaign_name:
+            raise ValueError("Network, campaign ID, and campaign name are required")
+        values = {
+            "currency": str(form.get("currency") or "EUR").upper()[:3],
+            "spend": max(0, float(form.get("spend") or 0)),
+            "impressions": max(0, int(form.get("impressions") or 0)),
+            "clicks": max(0, int(form.get("clicks") or 0)),
+            "conversions": max(0, float(form.get("conversions") or 0)),
+            "revenue": max(0, float(form.get("revenue") or 0)),
+        }
+        with session_scope() as session:
+            row = session.scalar(
+                select(AdCampaignDaily).where(
+                    AdCampaignDaily.workspace_id == ctx.workspace.id,
+                    AdCampaignDaily.platform == platform,
+                    AdCampaignDaily.external_campaign_id == campaign_id,
+                    AdCampaignDaily.metric_date == metric_date,
+                )
+            )
+            if row:
+                for key, value in values.items():
+                    setattr(row, key, value)
+                row.campaign_name = campaign_name
+                row.collected_at = utcnow()
+            else:
+                row = AdCampaignDaily(
+                    workspace_id=ctx.workspace.id,
+                    platform=platform,
+                    external_campaign_id=campaign_id,
+                    campaign_name=campaign_name,
+                    metric_date=metric_date,
+                    **values,
+                )
+                session.add(row)
+            audit(session, ctx.workspace.id, ctx.user.id, "ads.snapshot.saved", row)
+        return RedirectResponse("/ads?saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/ads?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/ads/export.csv")
+def ads_export(sess, days: int = 30):
+    ctx = _context(sess)
+    if not ctx:
+        return Response("Unauthorized", status_code=401)
+    days = days if days in {7, 30, 90, 365} else 30
+    with session_scope() as session:
+        rows = list(
+            session.scalars(
+                select(AdCampaignDaily)
+                .where(
+                    AdCampaignDaily.workspace_id == ctx.workspace.id,
+                    AdCampaignDaily.metric_date >= date.today() - timedelta(days=days),
+                )
+                .order_by(AdCampaignDaily.metric_date)
+            )
+        )
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "platform",
+            "campaign_id",
+            "campaign",
+            "date",
+            "currency",
+            "spend",
+            "impressions",
+            "clicks",
+            "conversions",
+            "revenue",
+        ]
+    )
+    for item in rows:
+        writer.writerow(
+            [
+                item.platform,
+                item.external_campaign_id,
+                item.campaign_name,
+                item.metric_date,
+                item.currency,
+                item.spend,
+                item.impressions,
+                item.clicks,
+                item.conversions,
+                item.revenue,
+            ]
+        )
+    return Response(
+        output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=fastsocial-ads.csv"},
+    )
+
+
 @rt("/reports")
 def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
     ctx = _context(sess)
@@ -4152,6 +4764,13 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
                 .order_by(desc(ReportSchedule.created_at))
             )
         )
+        runs = session.execute(
+            select(ReportRun, ReportSchedule)
+            .join(ReportSchedule, ReportRun.schedule_id == ReportSchedule.id)
+            .where(ReportSchedule.workspace_id == ctx.workspace.id)
+            .order_by(desc(ReportRun.created_at))
+            .limit(10)
+        ).all()
     top_rows = [
         Tr(
             Td(platform_pill(account.platform, account.display_name or account.username)),
@@ -4165,12 +4784,41 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
     schedule_rows = [
         Div(
             Div(
-                Strong(item.name), Small(f"{item.frequency.title()} · {', '.join(item.recipients)}")
+                Strong(item.name),
+                Small(
+                    f"{item.frequency.title()} · {item.report_days} days · "
+                    f"{', '.join(item.recipients)}"
+                ),
             ),
-            Span("ACTIVE" if item.active else "PAUSED", cls="mode-badge"),
+            Div(
+                Span("ACTIVE" if item.active else "PAUSED", cls="mode-badge"),
+                Form(
+                    csrf_input(sess),
+                    Button("Run now", type="submit", cls="btn small"),
+                    method="post",
+                    action=f"/reports/schedules/{item.id}/run",
+                ),
+                cls="report-row-actions",
+            ),
             cls="report-schedule-row",
         )
         for item in schedules
+    ]
+    run_rows = [
+        Div(
+            Div(
+                Strong(schedule.name),
+                Small(_format_datetime(run.created_at, ctx.workspace.timezone)),
+            ),
+            Div(
+                Span(run.status.upper(), cls=f"mode-badge report-{run.status}"),
+                A("Open", href=f"/reports/runs/{run.id}", cls="btn small")
+                if run.storage_key
+                else "",
+            ),
+            cls="report-schedule-row",
+        )
+        for run, schedule in runs
     ]
     return _app_page(
         ctx,
@@ -4187,6 +4835,7 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
                 A("30d", href="/reports?days=30", cls="btn small"),
                 A("90d", href="/reports?days=90", cls="btn small"),
                 A("1y", href="/reports?days=365", cls="btn small"),
+                A("Print view", href=f"/reports/print?days={days}", cls="btn"),
                 A("Export CSV", href=f"/reports/export.csv?days={days}", cls="btn primary"),
                 cls="report-actions",
             ),
@@ -4238,6 +4887,13 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
                         Option("Monthly", value="monthly", selected=True),
                         name="frequency",
                     ),
+                    Select(
+                        Option("Last 7 days", value="7"),
+                        Option("Last 30 days", value="30", selected=True),
+                        Option("Last 90 days", value="90"),
+                        Option("Last year", value="365"),
+                        name="report_days",
+                    ),
                     Input(
                         type="email",
                         name="recipients",
@@ -4259,9 +4915,13 @@ def reports_page(sess, days: int = 30, saved: str = "", error: str = ""):
                     cls="report-schedule-form",
                 ),
                 Small(
-                    "Schedules are stored now; automated email delivery activates when an email provider is connected.",
+                    "Reports always generate to private object storage. Email delivery uses Postmark when configured.",
                     cls="report-delivery-note",
                 ),
+                Div(H2("Recent runs"), cls="card-head"),
+                Div(*run_rows, cls="report-schedules")
+                if run_rows
+                else P("No report runs yet.", cls="card-body form-help"),
                 cls="card",
             ),
             cls="reports-layout",
@@ -4282,12 +4942,18 @@ async def report_schedule_add(request, sess):
     try:
         name = str(form.get("name") or "").strip()
         frequency = str(form.get("frequency") or "monthly")
+        report_days = int(form.get("report_days") or 30)
         recipients = [
             value.strip().lower()
             for value in str(form.get("recipients") or "").split(",")
             if value.strip()
         ]
-        if not name or frequency not in {"weekly", "monthly"} or not recipients:
+        if (
+            not name
+            or frequency not in {"weekly", "monthly"}
+            or report_days not in {7, 30, 90, 365}
+            or not recipients
+        ):
             raise ValueError("Name, frequency, and at least one recipient are required")
         if any("@" not in value for value in recipients):
             raise ValueError("Enter valid recipient email addresses")
@@ -4299,6 +4965,7 @@ async def report_schedule_add(request, sess):
                 frequency=frequency,
                 recipients=recipients,
                 sections=form.getlist("sections") or ["performance"],
+                report_days=report_days,
                 next_run_at=next_run,
                 created_by=ctx.user.id,
             )
@@ -4308,6 +4975,71 @@ async def report_schedule_add(request, sess):
         return RedirectResponse("/reports?saved=1", status_code=303)
     except Exception as exc:  # noqa: BLE001
         return RedirectResponse(f"/reports?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/reports/schedules/{schedule_id}/run", methods=["POST"])
+async def report_schedule_run(schedule_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(schedule_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        schedule = session.scalar(
+            select(ReportSchedule).where(
+                ReportSchedule.id == parsed,
+                ReportSchedule.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not schedule:
+            return Response("Not found", status_code=404)
+    run = await execute_report_schedule(parsed)
+    if run.status == "failed":
+        return RedirectResponse(f"/reports?error={quote_plus(run.error_message)}", status_code=303)
+    return RedirectResponse("/reports?saved=1", status_code=303)
+
+
+@rt("/reports/runs/{run_id}")
+def report_run_open(run_id: str, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    try:
+        parsed = uuid.UUID(run_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        run = session.scalar(
+            select(ReportRun)
+            .join(ReportSchedule, ReportRun.schedule_id == ReportSchedule.id)
+            .where(ReportRun.id == parsed, ReportSchedule.workspace_id == ctx.workspace.id)
+        )
+        if not run or not run.storage_key:
+            return Response("Not found", status_code=404)
+        body = media_storage().get(run.storage_key)
+    return Response(
+        body,
+        media_type="text/html",
+        headers={"Content-Disposition": f"inline; filename=fastsocial-report-{run_id}.html"},
+    )
+
+
+@rt("/reports/print")
+def report_print(sess, days: int = 30):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    days = days if days in {7, 30, 90, 365} else 30
+    with session_scope() as session:
+        report = report_summary(session, ctx.workspace.id, days)
+    return Response(render_report_html(ctx.workspace.name, report), media_type="text/html")
 
 
 @rt("/reports/export.csv")
@@ -4355,7 +5087,7 @@ def reports_export(sess, days: int = 30):
     )
 
 
-@rt("/inbox")
+@rt("/inbox", methods=["GET"])
 def inbox_page(sess, status: str = "all"):
     ctx = _context(sess)
     if not ctx:
@@ -4371,7 +5103,7 @@ def inbox_page(sess, status: str = "all"):
             query = query.where(InboxConversation.status == status)
         conversations = list(session.scalars(query.limit(100)))
     rows = [
-        Div(
+        A(
             Span(
                 PLATFORM_MARKS.get(item.platform, item.platform[:1].upper()),
                 cls=f"platform-mark {item.platform}",
@@ -4385,6 +5117,7 @@ def inbox_page(sess, status: str = "all"):
                 Small(_format_datetime(item.last_message_at, ctx.workspace.timezone)),
             ),
             Span(item.status.upper(), cls=f"inbox-state {item.status}"),
+            href=f"/inbox/{item.id}",
             cls="inbox-row",
         )
         for item in conversations
@@ -4396,7 +5129,7 @@ def inbox_page(sess, status: str = "all"):
         page_intro(
             "COMMUNITY",
             "One place for every conversation.",
-            "The tenant-safe inbox is ready for comments, direct messages, and reviews from connected provider collectors.",
+            "Triage comments, direct messages, and reviews, assign ownership, and reply through connected providers.",
         ),
         Div(
             A("All", href="/inbox", cls="btn small"),
@@ -4415,6 +5148,287 @@ def inbox_page(sess, status: str = "all"):
             "/integrations",
         ),
     )
+
+
+@rt("/inbox/{conversation_id}", methods=["GET"])
+def inbox_conversation_page(conversation_id: str, sess, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    try:
+        parsed = uuid.UUID(conversation_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(InboxConversation)
+            .where(
+                InboxConversation.id == parsed,
+                InboxConversation.workspace_id == ctx.workspace.id,
+            )
+            .options(selectinload(InboxConversation.messages))
+        )
+        if not conversation:
+            return Response("Not found", status_code=404)
+        replies = list(
+            session.scalars(
+                select(SavedReply)
+                .where(SavedReply.workspace_id == ctx.workspace.id)
+                .order_by(SavedReply.title)
+            )
+        )
+        members = session.execute(
+            select(User, WorkspaceMember)
+            .join(WorkspaceMember, WorkspaceMember.user_id == User.id)
+            .where(WorkspaceMember.workspace_id == ctx.workspace.id)
+            .order_by(User.name, User.email)
+        ).all()
+    messages = [
+        Div(
+            Div(
+                Strong(
+                    message.sender_name
+                    or ("You" if message.direction == "outbound" else "Social user")
+                ),
+                Small(_format_datetime(message.sent_at, ctx.workspace.timezone)),
+                cls="inbox-message-head",
+            ),
+            P(message.body),
+            Small(
+                message.delivery_status.upper()
+                + (f" · {message.error_message}" if message.error_message else ""),
+                cls=f"delivery-state {message.delivery_status}",
+            )
+            if message.direction == "outbound"
+            else "",
+            cls=f"inbox-message {message.direction}",
+        )
+        for message in sorted(conversation.messages, key=lambda item: item.sent_at)
+    ]
+    reply_options = "\n\n".join(f"/{item.shortcut} — {item.title}" for item in replies)
+    return _app_page(
+        ctx,
+        "Inbox",
+        "/inbox",
+        flash("Conversation updated." if saved else ""),
+        flash(error, "error"),
+        page_intro(
+            conversation.kind.upper(),
+            conversation.participant_name
+            or conversation.participant_handle
+            or "Social conversation",
+            f"{conversation.platform.title()} · {conversation.status.title()} · {conversation.priority.title()} priority",
+            A("← Inbox", href="/inbox", cls="btn"),
+        ),
+        Div(
+            Div(
+                Div(*messages, cls="inbox-thread")
+                if messages
+                else P("No messages have been collected yet.", cls="card-body form-help"),
+                Form(
+                    csrf_input(sess),
+                    Textarea(name="body", placeholder="Write a reply…", required=True, rows="4"),
+                    Small(
+                        f"Saved shortcuts: {reply_options}"
+                        if replies
+                        else "Create saved replies in the panel.",
+                        cls="form-help",
+                    ),
+                    Button("Send reply", type="submit", cls="btn primary"),
+                    method="post",
+                    action=f"/inbox/{conversation.id}/reply",
+                    cls="inbox-reply-form",
+                ),
+                cls="card inbox-thread-card",
+            ),
+            Div(
+                Div(
+                    H2("Triage"),
+                    Form(
+                        csrf_input(sess),
+                        Label("Status"),
+                        Select(
+                            *[
+                                Option(
+                                    value.title(),
+                                    value=value,
+                                    selected=conversation.status == value,
+                                )
+                                for value in ("unread", "open", "resolved")
+                            ],
+                            name="status",
+                        ),
+                        Label("Priority"),
+                        Select(
+                            *[
+                                Option(
+                                    value.title(),
+                                    value=value,
+                                    selected=conversation.priority == value,
+                                )
+                                for value in ("low", "normal", "high", "urgent")
+                            ],
+                            name="priority",
+                        ),
+                        Label("Assigned to"),
+                        Select(
+                            Option("Unassigned", value=""),
+                            *[
+                                Option(
+                                    user.name or user.email,
+                                    value=str(user.id),
+                                    selected=conversation.assigned_to == user.id,
+                                )
+                                for user, _membership in members
+                            ],
+                            name="assigned_to",
+                        ),
+                        Button("Update", type="submit", cls="btn"),
+                        method="post",
+                        action=f"/inbox/{conversation.id}/triage",
+                        cls="inbox-triage-form",
+                    ),
+                    cls="card inbox-side-card",
+                ),
+                Div(
+                    H2("Saved replies"),
+                    *[
+                        Div(Strong(f"/{item.shortcut}"), P(item.body), cls="saved-reply")
+                        for item in replies
+                    ],
+                    Form(
+                        csrf_input(sess),
+                        Input(name="title", placeholder="Launch timing", required=True),
+                        Input(name="shortcut", placeholder="launch", required=True),
+                        Textarea(
+                            name="body", placeholder="Reusable response…", required=True, rows="3"
+                        ),
+                        Input(type="hidden", name="return_to", value=str(conversation.id)),
+                        Button("Save reply", type="submit", cls="btn small"),
+                        method="post",
+                        action="/inbox/saved-replies",
+                    ),
+                    cls="card inbox-side-card",
+                ),
+                cls="inbox-sidebar",
+            ),
+            cls="inbox-detail-layout",
+        ),
+    )
+
+
+@rt("/inbox/{conversation_id}/triage", methods=["POST"])
+async def inbox_triage(conversation_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        parsed = uuid.UUID(conversation_id)
+        assigned = uuid.UUID(str(form.get("assigned_to"))) if form.get("assigned_to") else None
+    except ValueError:
+        return Response("Invalid conversation", status_code=400)
+    status = str(form.get("status") or "open")
+    priority = str(form.get("priority") or "normal")
+    if status not in {"unread", "open", "resolved"} or priority not in {
+        "low",
+        "normal",
+        "high",
+        "urgent",
+    }:
+        return Response("Invalid triage state", status_code=400)
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(InboxConversation).where(
+                InboxConversation.id == parsed,
+                InboxConversation.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not conversation:
+            return Response("Not found", status_code=404)
+        if assigned and not membership_for(session, ctx.workspace.id, assigned):
+            return Response("Invalid assignee", status_code=400)
+        conversation.status = status
+        conversation.priority = priority
+        conversation.assigned_to = assigned
+        audit(session, ctx.workspace.id, ctx.user.id, "inbox.triaged", conversation)
+    return RedirectResponse(f"/inbox/{conversation_id}?saved=1", status_code=303)
+
+
+@rt("/inbox/{conversation_id}/reply", methods=["POST"])
+async def inbox_reply(conversation_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    body = str(form.get("body") or "").strip()
+    try:
+        parsed = uuid.UUID(conversation_id)
+    except ValueError:
+        return Response("Not found", status_code=404)
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(InboxConversation).where(
+                InboxConversation.id == parsed,
+                InboxConversation.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not conversation:
+            return Response("Not found", status_code=404)
+    if not body:
+        return RedirectResponse(
+            f"/inbox/{conversation_id}?error=Reply+is+required", status_code=303
+        )
+    try:
+        await send_inbox_reply(parsed, ctx.user.id, body)
+        return RedirectResponse(f"/inbox/{conversation_id}?saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(
+            f"/inbox/{conversation_id}?error={quote_plus(str(exc))}", status_code=303
+        )
+
+
+@rt("/inbox/saved-replies", methods=["POST"])
+async def saved_reply_create(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    title = str(form.get("title") or "").strip()
+    shortcut = slugify(str(form.get("shortcut") or "").strip())[:80]
+    body = str(form.get("body") or "").strip()
+    return_to = str(form.get("return_to") or "")
+    if not title or not shortcut or not body:
+        return RedirectResponse(
+            f"/inbox/{return_to}?error=Complete+all+saved+reply+fields", status_code=303
+        )
+    try:
+        with session_scope() as session:
+            reply = SavedReply(
+                workspace_id=ctx.workspace.id,
+                title=title,
+                shortcut=shortcut,
+                body=body,
+                created_by=ctx.user.id,
+            )
+            session.add(reply)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "inbox.saved_reply.created", reply)
+        return RedirectResponse(f"/inbox/{return_to}?saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/inbox/{return_to}?error={quote_plus(str(exc))}", status_code=303)
 
 
 @rt("/smartlinks", methods=["GET"])

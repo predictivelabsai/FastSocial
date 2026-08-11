@@ -131,3 +131,24 @@ class ManagedMCPClient:
             return {"ok": bool(body.get("ok", True)), "raw": body}
         except SocialAPIError as exc:
             return {"ok": False, "error": str(exc)}
+
+    async def reply_to_conversation(
+        self, account: SocialAccount, conversation_id: str, body: str, kind: str
+    ) -> str:
+        tool = account.account_metadata.get("inbox_reply_tool")
+        if not tool:
+            raise SocialAPIError("No inbox reply MCP tool is configured for this account")
+        result = await self._call(
+            account,
+            tool,
+            {
+                "account_id": account.external_account_id,
+                "conversation_id": conversation_id,
+                "body": body,
+                "kind": kind,
+            },
+        )
+        message_id = str(result.get("message_id") or result.get("id") or "")
+        if not message_id:
+            raise SocialAPIError("MCP inbox tool did not return a message ID")
+        return message_id

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import calendar as calendar_module
 import hashlib
 import io
 import logging
 import uuid
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, select
@@ -18,6 +20,9 @@ from fastsocial.models import (
     AccountMetricDaily,
     AccountStatus,
     AuditLog,
+    ContentAutolist,
+    InboxConversation,
+    InboxMessage,
     Media,
     Post,
     PostMedia,
@@ -391,6 +396,148 @@ async def publish_due_posts(limit: int = 25) -> int:
     for post_id in ids:
         await publish_post(post_id)
     return len(ids)
+
+
+def next_autolist_run(
+    *, cadence: str, publish_time: str, timezone: str, after: datetime | None = None
+) -> datetime:
+    """Return the next cadence boundary in UTC, preserving the workspace wall time."""
+    now = after or utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("UTC"))
+    zone = ZoneInfo(timezone)
+    local = now.astimezone(zone)
+    hour, minute = (int(part) for part in publish_time.split(":", 1))
+    candidate = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= local:
+        if cadence == "monthly":
+            year = candidate.year + (1 if candidate.month == 12 else 0)
+            month = 1 if candidate.month == 12 else candidate.month + 1
+            day = min(candidate.day, calendar_module.monthrange(year, month)[1])
+            candidate = candidate.replace(year=year, month=month, day=day)
+        else:
+            candidate += timedelta(days=1 if cadence == "daily" else 7)
+    return candidate.astimezone(ZoneInfo("UTC"))
+
+
+async def process_due_autolists(limit: int = 25) -> int:
+    """Create the next scheduled post from each due evergreen content list."""
+    now = utcnow()
+    created = 0
+    with session_scope() as session:
+        query = (
+            select(ContentAutolist)
+            .where(
+                ContentAutolist.active.is_(True),
+                ContentAutolist.next_run_at.is_not(None),
+                ContentAutolist.next_run_at <= now,
+            )
+            .options(selectinload(ContentAutolist.items))
+            .order_by(ContentAutolist.next_run_at)
+            .limit(limit)
+        )
+        if session.bind and session.bind.dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        lists = list(session.scalars(query))
+        for autolist in lists:
+            items = [item for item in autolist.items if item.active]
+            if not items:
+                autolist.active = False
+                continue
+            item = items[autolist.current_index % len(items)]
+            try:
+                workspace = session.get(Workspace, autolist.workspace_id)
+                target_ids = [uuid.UUID(value) for value in autolist.target_ids]
+                media_ids = [uuid.UUID(value) for value in item.media_ids]
+                post = create_post(
+                    session,
+                    workspace=workspace,
+                    user_id=autolist.created_by,
+                    text=item.text,
+                    target_ids=target_ids,
+                    media_ids=media_ids,
+                    scheduled_at=now,
+                )
+                item.used_count += 1
+                item.last_used_at = now
+                autolist.current_index = (autolist.current_index + 1) % len(items)
+                autolist.next_run_at = next_autolist_run(
+                    cadence=autolist.cadence,
+                    publish_time=autolist.publish_time,
+                    timezone=autolist.timezone,
+                    after=now,
+                )
+                audit(
+                    session,
+                    autolist.workspace_id,
+                    autolist.created_by,
+                    "autolist.post.created",
+                    post,
+                    {"autolist_id": str(autolist.id), "item_id": str(item.id)},
+                )
+                created += 1
+            except Exception as exc:  # noqa: BLE001
+                autolist.next_run_at = now + timedelta(hours=1)
+                log.exception("Autolist processing failed for %s: %s", autolist.id, exc)
+    return created
+
+
+async def send_inbox_reply(
+    conversation_id: uuid.UUID, user_id: uuid.UUID, body: str
+) -> InboxMessage:
+    """Dispatch a reply through the configured provider and persist its exact delivery state."""
+    failure: Exception | None = None
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(InboxConversation)
+            .where(InboxConversation.id == conversation_id)
+            .options(selectinload(InboxConversation.messages))
+        )
+        if not conversation or not conversation.social_account_id:
+            raise ValueError("This conversation has no connected reply account")
+        account = session.get(SocialAccount, conversation.social_account_id)
+        if not account or account.workspace_id != conversation.workspace_id:
+            raise ValueError("The reply account is unavailable")
+        message = InboxMessage(
+            conversation_id=conversation.id,
+            direction="outbound",
+            sender_name="FastSocial",
+            body=body.strip(),
+            delivery_status="sending",
+            sent_at=utcnow(),
+        )
+        session.add(message)
+        session.flush()
+        try:
+            sender = getattr(client_for(account), "reply_to_conversation", None)
+            if not sender:
+                raise SocialAPIError(
+                    "Direct replies are not available for this network; connect Arcade or Composio"
+                )
+            message.external_message_id = await sender(
+                account, conversation.external_conversation_id, body.strip(), conversation.kind
+            )
+            message.delivery_status = "sent"
+            conversation.status = "open"
+            conversation.last_message_preview = body.strip()[:500]
+            conversation.last_message_at = message.sent_at
+            audit(session, conversation.workspace_id, user_id, "inbox.reply.sent", message)
+        except Exception as exc:
+            message.delivery_status = "failed"
+            message.error_message = str(exc)
+            failure = exc
+            audit(
+                session,
+                conversation.workspace_id,
+                user_id,
+                "inbox.reply.failed",
+                message,
+                {"error": str(exc)},
+            )
+        result = message
+    if failure:
+        raise SocialAPIError(str(failure)) from failure
+    return result
 
 
 async def collect_metrics() -> int:

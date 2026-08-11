@@ -42,6 +42,10 @@ class SocialClient(Protocol):
 
     async def health(self, account: SocialAccount) -> dict: ...
 
+    async def reply_to_conversation(
+        self, account: SocialAccount, conversation_id: str, body: str, kind: str
+    ) -> str: ...
+
 
 class SocialAPIError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False, status_code: int | None = None):

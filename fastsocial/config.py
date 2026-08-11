@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     composio_api_key: str = Field("", alias="COMPOSIO_API_KEY")
     composio_mcp_url: str = Field("", alias="COMPOSIO_MCP_URL")
 
+    postmark_server_token: str = Field("", alias="POSTMARK_SERVER_TOKEN")
+    report_from_email: str = Field("reports@fastsocial.org", alias="REPORT_FROM_EMAIL")
+
     @field_validator("service_url")
     @classmethod
     def trim_service_url(cls, value: str) -> str:

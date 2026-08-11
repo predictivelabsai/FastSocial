@@ -55,6 +55,12 @@ class MockClient:
     async def health(self, account: SocialAccount) -> dict:
         return {"ok": True, "provider": "mock"}
 
+    async def reply_to_conversation(
+        self, account: SocialAccount, conversation_id: str, body: str, kind: str
+    ) -> str:
+        seed = f"{account.id}:{conversation_id}:{body}:{time.time_ns()}"
+        return "mock_reply_" + hashlib.sha256(seed.encode()).hexdigest()[:18]
+
 
 class XClient:
     base_url = "https://api.x.com/2"
