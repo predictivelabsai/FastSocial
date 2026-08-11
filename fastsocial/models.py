@@ -12,6 +12,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -355,6 +356,175 @@ class AccountMetricDaily(Base):
     engagement: Mapped[int] = mapped_column(BigInteger, default=0)
     reach: Mapped[int] = mapped_column(BigInteger, default=0)
     raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class CompetitorProfile(Base):
+    __tablename__ = "competitor_profiles"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "platform", "handle"),
+        Index("ix_competitor_workspace_active", "workspace_id", "active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    platform: Mapped[str] = mapped_column(String(40), index=True)
+    handle: Mapped[str] = mapped_column(String(255))
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    profile_url: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    profile_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    snapshots: Mapped[list[CompetitorMetricDaily]] = relationship(
+        back_populates="competitor", cascade="all, delete-orphan"
+    )
+
+
+class CompetitorMetricDaily(Base):
+    __tablename__ = "competitor_metrics_daily"
+    __table_args__ = (
+        UniqueConstraint("competitor_id", "metric_date"),
+        Index("ix_competitor_metrics_date", "competitor_id", "metric_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    competitor_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("competitor_profiles.id", ondelete="CASCADE"), index=True
+    )
+    metric_date: Mapped[date] = mapped_column(Date)
+    followers: Mapped[int] = mapped_column(BigInteger, default=0)
+    posts: Mapped[int] = mapped_column(Integer, default=0)
+    engagement: Mapped[int] = mapped_column(BigInteger, default=0)
+    reach: Mapped[int] = mapped_column(BigInteger, default=0)
+    engagement_rate: Mapped[float] = mapped_column(Float, default=0)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    competitor: Mapped[CompetitorProfile] = relationship(back_populates="snapshots")
+
+
+class InboxConversation(Base):
+    __tablename__ = "inbox_conversations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "platform", "external_conversation_id"),
+        Index("ix_inbox_workspace_status_updated", "workspace_id", "status", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    social_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("social_accounts.id", ondelete="SET NULL"), index=True
+    )
+    platform: Mapped[str] = mapped_column(String(40), index=True)
+    external_conversation_id: Mapped[str] = mapped_column(String(500))
+    kind: Mapped[str] = mapped_column(String(40), default="comment")
+    participant_name: Mapped[str] = mapped_column(String(255), default="")
+    participant_handle: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(40), default="unread", index=True)
+    last_message_preview: Mapped[str] = mapped_column(Text, default="")
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    conversation_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    messages: Mapped[list[InboxMessage]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+
+
+class InboxMessage(Base):
+    __tablename__ = "inbox_messages"
+    __table_args__ = (Index("ix_inbox_messages_conversation_sent", "conversation_id", "sent_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("inbox_conversations.id", ondelete="CASCADE"), index=True
+    )
+    external_message_id: Mapped[str] = mapped_column(String(500), default="")
+    direction: Mapped[str] = mapped_column(String(20), default="inbound")
+    sender_name: Mapped[str] = mapped_column(String(255), default="")
+    body: Mapped[str] = mapped_column(Text)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    message_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    conversation: Mapped[InboxConversation] = relationship(back_populates="messages")
+
+
+class ReportSchedule(Base):
+    __tablename__ = "report_schedules"
+    __table_args__ = (Index("ix_report_schedules_workspace_active", "workspace_id", "active"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    frequency: Mapped[str] = mapped_column(String(40), default="monthly")
+    recipients: Mapped[list[str]] = mapped_column(JSON, default=list)
+    sections: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class SmartLinkPage(Base):
+    __tablename__ = "smartlink_pages"
+    __table_args__ = (Index("ix_smartlink_workspace_created", "workspace_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    slug: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    bio: Mapped[str] = mapped_column(Text, default="")
+    theme: Mapped[str] = mapped_column(String(40), default="sage")
+    published: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    view_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    items: Mapped[list[SmartLinkItem]] = relationship(
+        back_populates="page", cascade="all, delete-orphan", order_by="SmartLinkItem.position"
+    )
+
+
+class SmartLinkItem(Base):
+    __tablename__ = "smartlink_items"
+    __table_args__ = (Index("ix_smartlink_items_page_position", "page_id", "position"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    page_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("smartlink_pages.id", ondelete="CASCADE"), index=True
+    )
+    label: Mapped[str] = mapped_column(String(255))
+    url: Mapped[str] = mapped_column(Text)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    click_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    page: Mapped[SmartLinkPage] = relationship(back_populates="items")
 
 
 class PostApproval(Base):

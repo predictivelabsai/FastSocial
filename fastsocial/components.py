@@ -36,6 +36,10 @@ ICONS = {
     "posts": "≡",
     "media": "▧",
     "analytics": "⌁",
+    "competitors": "◎",
+    "inbox": "✉",
+    "reports": "▤",
+    "smartlinks": "↗",
     "approvals": "✓",
     "integrations": "⇄",
     "team": "♙",
@@ -110,10 +114,14 @@ def sidebar(
 ):
     items = [
         ("Dashboard", "/", "dashboard"),
-        ("Calendar", "/calendar", "calendar"),
+        ("Planner", "/calendar", "calendar"),
         ("Posts", "/posts", "posts"),
         ("Media", "/media", "media"),
         ("Analytics", "/analytics", "analytics"),
+        ("Competitors", "/competitors", "competitors"),
+        ("Inbox", "/inbox", "inbox"),
+        ("Reports", "/reports", "reports"),
+        ("SmartLinks", "/smartlinks", "smartlinks"),
     ]
     main_links = [
         A(

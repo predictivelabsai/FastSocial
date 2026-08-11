@@ -11,10 +11,15 @@ Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateway
 - FastVC-style left navigation and a dedicated integration status page
 - Direct, Arcade MCP, and Composio MCP connection paths per social account
 - Encrypted credentials and OAuth tokens
-- Multi-account composer, drafts, scheduling, queue, and calendar
+- Multi-account composer, drafts, scheduling, and month/week/list planner views
+- Best-time recommendations derived from the latest post-performance snapshots
 - Private local or Cloudflare R2 media library
 - Idempotent publishing worker with per-target retry state
 - Post/account metrics, server-rendered SVG analytics, and CSV export
+- Competitor profiles with historical growth/engagement snapshots and export
+- Unified brand reports with saved delivery schedules
+- Public SmartLinks with themes plus live view and click measurement
+- Tenant-safe unified inbox foundation for provider message/comment collectors
 - Personal publishing without approval; optional team approval workflow
 - Agentic Create / Generate → Review → Post chats with an optional autonomous YOLO mode
 - 49 editable, versioned marketing skills vendored from Corey's Marketing Skills
