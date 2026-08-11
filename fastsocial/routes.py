@@ -96,12 +96,15 @@ from fastsocial.models import (
     ChatMessage,
     ChatRole,
     ChatSession,
+    CollectionRun,
     CompetitorMetricDaily,
     CompetitorProfile,
     ConnectionProvider,
     ContentArtifact,
     ContentAutolist,
     InboxConversation,
+    ListeningMention,
+    ListeningQuery,
     Media,
     ModelProfile,
     Post,
@@ -119,6 +122,8 @@ from fastsocial.models import (
     SocialAccount,
     TargetStatus,
     User,
+    WebsiteEvent,
+    WebsiteSite,
     WorkflowMode,
     WorkflowStage,
     Workspace,
@@ -138,6 +143,8 @@ from fastsocial.security import (
 from fastsocial.services import (
     audit,
     check_account_health,
+    collect_live_data,
+    collect_provider_listening,
     create_post,
     get_or_create_user,
     membership_for,
@@ -670,7 +677,7 @@ def dashboard(sess):
             A("+ New Post", href="/new-post", cls="btn primary"),
         ),
         Div(
-            stat_card("Connected accounts", len(ctx.accounts), "Across X, LinkedIn, and Bluesky"),
+            stat_card("Connected accounts", len(ctx.accounts), "Across all publishing channels"),
             stat_card("Published posts", published_count, "All-time in this workspace"),
             stat_card("Impressions", f"{int(metric_totals[0]):,}", "Latest collected snapshots"),
             stat_card("Engagements", f"{int(metric_totals[1]):,}", "Likes, comments, and shares"),
@@ -948,6 +955,12 @@ def _workflow_steps(stage: WorkflowStage):
     )
 
 
+def _account_can_publish(account: SocialAccount) -> bool:
+    return account.provider in {ConnectionProvider.direct, ConnectionProvider.mock} or bool(
+        account.account_metadata.get("publish_tool")
+    )
+
+
 def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
     account_options = [
         Label(
@@ -965,7 +978,7 @@ def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
             cls="account-option",
         )
         for account in ctx.accounts
-        if account.status == AccountStatus.connected
+        if account.status == AccountStatus.connected and _account_can_publish(account)
     ]
     suggestions = (
         (
@@ -1169,7 +1182,11 @@ async def new_post(request, sess):
             str(form.get("workflow_mode") or ctx.workspace.default_workflow_mode.value)
         )
         target_ids = [uuid.UUID(value) for value in form.getlist("target_ids")]
-        target_map = {str(account.id): account.platform for account in ctx.accounts}
+        target_map = {
+            str(account.id): account.platform
+            for account in ctx.accounts
+            if _account_can_publish(account)
+        }
         platforms = list(
             dict.fromkeys(target_map[str(item)] for item in target_ids if str(item) in target_map)
         )
@@ -2627,6 +2644,7 @@ def autolists_page(sess, saved: str = "", error: str = ""):
                         cls="check-row",
                     )
                     for account in ctx.accounts
+                    if _account_can_publish(account)
                 ],
                 cls="target-checks",
             ),
@@ -2670,7 +2688,7 @@ async def autolist_create(request, sess):
         cadence = str(form.get("cadence") or "weekly")
         publish_time = str(form.get("publish_time") or "09:00")
         target_ids = [uuid.UUID(value) for value in form.getlist("target_ids")]
-        valid_targets = {account.id for account in ctx.accounts}
+        valid_targets = {account.id for account in ctx.accounts if _account_can_publish(account)}
         if not name or cadence not in {"daily", "weekly", "monthly"}:
             raise ValueError("Enter a name and valid cadence")
         if not target_ids or not set(target_ids).issubset(valid_targets):
@@ -2933,7 +2951,7 @@ def _integration_card(platform: str, accounts: list[SocialAccount]):
         "x": bool(settings().x_client_id and settings().x_client_secret),
         "linkedin": bool(settings().linkedin_client_id and settings().linkedin_client_secret),
         "bluesky": settings().bluesky_app_password_enabled,
-    }[platform]
+    }.get(platform, False)
     paths = [
         (
             "Direct OAuth",
@@ -3015,7 +3033,15 @@ def _integration_card(platform: str, accounts: list[SocialAccount]):
                 "x": "Publish posts and collect public and authorized metrics.",
                 "linkedin": "Publish personal or organization content using LinkedIn's versioned Posts API.",
                 "bluesky": "Publish through the open AT Protocol using a revocable app password.",
-            }[platform]
+                "facebook": "Plan Pages content, collect engagement, moderate comments, and connect Meta Ads.",
+                "instagram": "Publish visual content, collect Insights, comments, Reels, and Stories metrics.",
+                "threads": "Publish and measure Threads content through a managed official connector.",
+                "tiktok": "Schedule short-form video, collect performance, comments, and TikTok Ads metrics.",
+                "youtube": "Schedule videos and Shorts, measure channel growth, and manage comments.",
+                "pinterest": "Publish Pins and measure board, audience, and outbound-click performance.",
+                "google_business": "Publish updates, monitor reviews, and collect Google Ads campaign data.",
+                "twitch": "Track channel and stream performance through a managed connector.",
+            }.get(platform, "Connect publishing, engagement, and measurement capabilities.")
         ),
         Div(*path_cards, cls="connection-paths"),
         (
@@ -3141,24 +3167,59 @@ def integrations_page(sess, saved: str = "", error: str = ""):
                 select(ModelProfile).where(ModelProfile.workspace_id == ctx.workspace.id)
             )
         }
+        collection_runs = session.execute(
+            select(CollectionRun, SocialAccount)
+            .join(SocialAccount, CollectionRun.social_account_id == SocialAccount.id)
+            .where(CollectionRun.workspace_id == ctx.workspace.id)
+            .order_by(desc(CollectionRun.started_at))
+            .limit(20)
+        ).all()
+    collection_rows = [
+        Div(
+            Div(
+                Strong(
+                    f"{PLATFORM_NAMES.get(account.platform, account.platform.title())} · "
+                    f"{run.collector_kind.title()}"
+                ),
+                Small(_format_datetime(run.started_at, ctx.workspace.timezone)),
+            ),
+            Div(
+                Small(f"{run.records_written}/{run.records_seen} records"),
+                Span(run.status.upper(), cls=f"mode-badge collection-{run.status}"),
+            ),
+            cls="report-schedule-row",
+        )
+        for run, account in collection_runs
+    ]
     return _app_page(
         ctx,
         "Integrations",
         "/integrations",
         page_intro(
             "CONNECT",
-            "One workspace. Three ways to connect.",
-            "Use direct platform credentials, Arcade MCP, or Composio MCP account by account. Tokens are never displayed after connection.",
-            Form(
-                csrf_input(sess),
-                Button("Check connections", type="submit", cls="btn"),
-                method="post",
-                action="/integrations/health",
+            "Every network and data surface in one workspace.",
+            "Use direct credentials where supported, or map Arcade and Composio tools for publishing, Inbox, Ads, metrics, and competitors.",
+            Div(
+                Form(
+                    csrf_input(sess),
+                    Button("Sync live data", type="submit", cls="btn primary"),
+                    method="post",
+                    action="/integrations/collect",
+                ),
+                Form(
+                    csrf_input(sess),
+                    Button("Check connections", type="submit", cls="btn"),
+                    method="post",
+                    action="/integrations/health",
+                ),
+                cls="form-actions",
             ),
         ),
         flash(
             "Connection health refreshed."
             if saved == "health"
+            else "Live provider data synchronized."
+            if saved == "collect"
             else ("Integration connected." if saved else "")
         ),
         flash(error, "error"),
@@ -3189,6 +3250,17 @@ def integrations_page(sess, saved: str = "", error: str = ""):
         Div(
             *[_integration_card(platform, grouped[platform]) for platform in PLATFORM_NAMES],
             style="display:grid;gap:16px",
+        ),
+        Div(
+            Div(
+                H2("Collection activity"),
+                Small("Inbox every 10 minutes · Ads and competitors hourly"),
+                cls="card-head",
+            ),
+            Div(*collection_rows, cls="report-schedules")
+            if collection_rows
+            else P("No live collection runs yet.", cls="card-body form-help"),
+            cls="card",
         ),
     )
 
@@ -3319,6 +3391,20 @@ async def integrations_health(request, sess):
     return RedirectResponse("/integrations?saved=health", status_code=303)
 
 
+@rt("/integrations/collect", methods=["POST"])
+async def integrations_collect(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    await collect_live_data(ctx.workspace.id)
+    return RedirectResponse("/integrations?saved=collect", status_code=303)
+
+
 @rt("/integrations/connect/{platform}/{provider}")
 async def integration_connect(platform: str, provider: str, request, sess):
     ctx = _context(sess)
@@ -3368,16 +3454,26 @@ async def integration_connect(platform: str, provider: str, request, sess):
         elif provider_enum in {ConnectionProvider.arcade, ConnectionProvider.composio}:
             external_id = str(form.get("external_account_id") or "").strip()
             username = str(form.get("username") or "").strip()
-            publish_tool = str(form.get("publish_tool") or "").strip()
-            if not external_id or not publish_tool:
-                error = "Connected account ID and publish tool name are required."
+            capability_tools = {
+                key: str(form.get(key) or "").strip()
+                for key in (
+                    "publish_tool",
+                    "metrics_tool",
+                    "account_metrics_tool",
+                    "health_tool",
+                    "inbox_collect_tool",
+                    "inbox_reply_tool",
+                    "ads_metrics_tool",
+                    "competitor_metrics_tool",
+                    "listening_tool",
+                )
+            }
+            if not external_id or not any(capability_tools.values()):
+                error = "Connected account ID and at least one capability tool are required."
             else:
                 metadata = {
                     "managed_user_id": str(form.get("managed_user_id") or ctx.user.id),
-                    "publish_tool": publish_tool,
-                    "metrics_tool": str(form.get("metrics_tool") or "").strip(),
-                    "account_metrics_tool": str(form.get("account_metrics_tool") or "").strip(),
-                    "health_tool": str(form.get("health_tool") or "").strip(),
+                    **capability_tools,
                 }
                 with session_scope() as session:
                     account = SocialAccount(
@@ -3424,6 +3520,11 @@ async def integration_connect(platform: str, provider: str, request, sess):
             return RedirectResponse(f"/integrations?saved=1#{platform}", status_code=303)
     if provider_enum == ConnectionProvider.direct and platform in {"x", "linkedin"}:
         return RedirectResponse(f"/oauth/{platform}/start", status_code=303)
+    if provider_enum == ConnectionProvider.direct and platform != "bluesky":
+        return RedirectResponse(
+            f"/integrations?error={quote_plus('Use Arcade or Composio for this network')}#{platform}",
+            status_code=303,
+        )
     fields = []
     if provider_enum == ConnectionProvider.direct:
         fields = [
@@ -3464,7 +3565,7 @@ async def integration_connect(platform: str, provider: str, request, sess):
             ),
             Div(
                 Label("Publish MCP tool"),
-                Input(type="text", name="publish_tool", placeholder="X.CreatePost", required=True),
+                Input(type="text", name="publish_tool", placeholder="Optional · e.g. X.CreatePost"),
                 cls="field",
             ),
             Div(
@@ -3480,6 +3581,31 @@ async def integration_connect(platform: str, provider: str, request, sess):
             Div(
                 Label("Health-check tool"),
                 Input(type="text", name="health_tool", placeholder="Optional"),
+                cls="field",
+            ),
+            Div(
+                Label("Inbox collection tool"),
+                Input(type="text", name="inbox_collect_tool", placeholder="Optional"),
+                cls="field",
+            ),
+            Div(
+                Label("Inbox reply tool"),
+                Input(type="text", name="inbox_reply_tool", placeholder="Optional"),
+                cls="field",
+            ),
+            Div(
+                Label("Ads metrics tool"),
+                Input(type="text", name="ads_metrics_tool", placeholder="Optional"),
+                cls="field",
+            ),
+            Div(
+                Label("Competitor metrics tool"),
+                Input(type="text", name="competitor_metrics_tool", placeholder="Optional"),
+                cls="field",
+            ),
+            Div(
+                Label("Listening / hashtag tool"),
+                Input(type="text", name="listening_tool", placeholder="Optional"),
                 cls="field",
             ),
         ]
@@ -4745,6 +4871,420 @@ def ads_export(sess, days: int = 30):
         output.getvalue(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=fastsocial-ads.csv"},
+    )
+
+
+@rt("/listening", methods=["GET"])
+def listening_page(sess, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    since = utcnow() - timedelta(days=30)
+    with session_scope() as session:
+        definitions = list(
+            session.scalars(
+                select(ListeningQuery)
+                .where(ListeningQuery.workspace_id == ctx.workspace.id)
+                .order_by(desc(ListeningQuery.created_at))
+            )
+        )
+        mentions = session.execute(
+            select(ListeningMention, ListeningQuery)
+            .join(ListeningQuery, ListeningMention.query_id == ListeningQuery.id)
+            .where(
+                ListeningQuery.workspace_id == ctx.workspace.id,
+                ListeningMention.published_at >= since,
+            )
+            .order_by(desc(ListeningMention.published_at))
+            .limit(250)
+        ).all()
+    sentiment_counts = {
+        value: sum(mention.sentiment == value for mention, _query in mentions)
+        for value in ("positive", "neutral", "negative")
+    }
+    query_cards = [
+        Div(
+            Div(
+                Div(Strong(item.name), Small(f"{item.kind.title()} · {item.query}")),
+                Span("ACTIVE" if item.active else "PAUSED", cls="mode-badge"),
+                cls="integration-card-head",
+            ),
+            Div(
+                *[platform_pill(platform) for platform in item.platforms]
+                if item.platforms
+                else Span("All connected networks", cls="form-help"),
+                cls="listening-platforms",
+            ),
+            cls="card listening-query-card",
+        )
+        for item in definitions
+    ]
+    mention_rows = [
+        Div(
+            Span(
+                PLATFORM_MARKS.get(mention.platform, mention.platform[:1].upper()),
+                cls=f"platform-mark {mention.platform}",
+            ),
+            Div(
+                Div(
+                    Strong(mention.author_name or mention.author_handle or "Social user"),
+                    Small(
+                        f"{query.name} · {_format_datetime(mention.published_at, ctx.workspace.timezone)}"
+                    ),
+                ),
+                P(mention.content),
+                Small(f"Reach {mention.reach:,} · Engagement {mention.engagement:,}"),
+            ),
+            Div(
+                Span(mention.sentiment.upper(), cls=f"sentiment {mention.sentiment}"),
+                A("Open", href=mention.url, target="_blank", rel="noopener", cls="btn small")
+                if mention.url
+                else "",
+            ),
+            cls="listening-mention",
+        )
+        for mention, query in mentions
+    ]
+    create_form = Form(
+        csrf_input(sess),
+        Div(
+            Div(
+                Label("Tracker name"),
+                Input(name="name", placeholder="Brand mentions", required=True),
+                cls="field",
+            ),
+            Div(
+                Label("Type"),
+                Select(
+                    Option("Keyword", value="keyword"),
+                    Option("Hashtag", value="hashtag"),
+                    name="kind",
+                ),
+                cls="field",
+            ),
+            Div(
+                Label("Query"),
+                Input(name="query", placeholder="FastSocial or #FastSocial", required=True),
+                cls="field",
+            ),
+            cls="listening-create-grid",
+        ),
+        Div(
+            Label("Networks"),
+            Div(
+                *[
+                    Label(
+                        Input(type="checkbox", name="platforms", value=platform),
+                        f" {name}",
+                        cls="check-row",
+                    )
+                    for platform, name in PLATFORM_NAMES.items()
+                ],
+                cls="target-checks",
+            ),
+            Small("Leave all unchecked to use every connected network with listening support."),
+            cls="field",
+        ),
+        Button("Start listening", type="submit", cls="btn primary"),
+        method="post",
+        action="/listening",
+        cls="card listening-create-form",
+    )
+    return _app_page(
+        ctx,
+        "Listening",
+        "/listening",
+        flash("Listening tracker updated." if saved else ""),
+        flash(error, "error"),
+        page_intro(
+            "LISTENING + HASHTAGS",
+            "See the conversations around your brand.",
+            "Collect keyword and hashtag mentions, compare reach and engagement, and triage sentiment across connected networks.",
+            Form(
+                csrf_input(sess),
+                Button("Sync mentions", type="submit", cls="btn primary"),
+                method="post",
+                action="/listening/collect",
+            ),
+        ),
+        Div(
+            stat_card("Mentions", len(mentions), "Last 30 days"),
+            stat_card("Positive", sentiment_counts["positive"]),
+            stat_card("Neutral", sentiment_counts["neutral"]),
+            stat_card("Negative", sentiment_counts["negative"]),
+            cls="stats-grid",
+        ),
+        Div(*query_cards, cls="listening-query-grid") if query_cards else "",
+        Div(*mention_rows, cls="card listening-feed")
+        if mention_rows
+        else empty_state(
+            "◉",
+            "No mentions collected yet",
+            "Create a tracker and sync a listening-capable integration.",
+        ),
+        Div(H2("Create a tracker"), cls="section-heading"),
+        create_form,
+    )
+
+
+@rt("/listening", methods=["POST"])
+async def listening_create(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    name = str(form.get("name") or "").strip()
+    value = str(form.get("query") or "").strip()
+    kind = str(form.get("kind") or "keyword")
+    platforms = [item for item in form.getlist("platforms") if item in PLATFORM_NAMES]
+    if not name or not value or kind not in {"keyword", "hashtag"}:
+        return RedirectResponse("/listening?error=Name+and+query+are+required", status_code=303)
+    if kind == "hashtag" and not value.startswith("#"):
+        value = f"#{value}"
+    try:
+        with session_scope() as session:
+            definition = ListeningQuery(
+                workspace_id=ctx.workspace.id,
+                name=name,
+                query=value,
+                kind=kind,
+                platforms=platforms,
+                created_by=ctx.user.id,
+            )
+            session.add(definition)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "listening.query.created", definition)
+        return RedirectResponse("/listening?saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/listening?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/listening/collect", methods=["POST"])
+async def listening_collect(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    await collect_provider_listening(ctx.workspace.id)
+    return RedirectResponse("/listening?saved=1", status_code=303)
+
+
+@rt("/websites", methods=["GET"])
+def websites_page(sess, site: str = "", saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    since = utcnow() - timedelta(hours=24)
+    with session_scope() as session:
+        sites = list(
+            session.scalars(
+                select(WebsiteSite)
+                .where(WebsiteSite.workspace_id == ctx.workspace.id)
+                .order_by(WebsiteSite.name)
+            )
+        )
+        selected = next(
+            (item for item in sites if str(item.id) == site), sites[0] if sites else None
+        )
+        events = (
+            list(
+                session.scalars(
+                    select(WebsiteEvent)
+                    .where(WebsiteEvent.site_id == selected.id, WebsiteEvent.occurred_at >= since)
+                    .order_by(desc(WebsiteEvent.occurred_at))
+                    .limit(500)
+                )
+            )
+            if selected
+            else []
+        )
+    pageviews = sum(item.event_type == "pageview" for item in events)
+    conversions = sum(item.event_type == "conversion" for item in events)
+    visitors = len({item.visitor_hash for item in events if item.visitor_hash})
+    paths: dict[str, int] = {}
+    referrers: dict[str, int] = {}
+    for event in events:
+        paths[event.path] = paths.get(event.path, 0) + 1
+        if event.referrer_domain:
+            referrers[event.referrer_domain] = referrers.get(event.referrer_domain, 0) + 1
+    site_tabs = Div(
+        *[
+            A(
+                item.name,
+                href=f"/websites?site={item.id}",
+                cls=f"btn small{' primary' if selected and item.id == selected.id else ''}",
+            )
+            for item in sites
+        ],
+        cls="planner-view-tabs",
+    )
+    analytics = ""
+    if selected:
+        snippet = (
+            f'<script async src="{settings().service_url}/static/tracker.js" '
+            f'data-site="{selected.tracking_key}"></script>'
+        )
+        analytics = Div(
+            Div(
+                stat_card("Pageviews", pageviews, "Last 24 hours"),
+                stat_card("Visitors", visitors, "Privacy-safe browser IDs"),
+                stat_card("Conversions", conversions),
+                stat_card("Live events", len(events)),
+                cls="stats-grid",
+            ),
+            Div(
+                Div(
+                    Div(H2("Top pages"), cls="card-head"),
+                    *[
+                        Div(Span(path), Strong(str(count)), cls="website-rank-row")
+                        for path, count in sorted(
+                            paths.items(), key=lambda item: item[1], reverse=True
+                        )[:10]
+                    ],
+                    P("No traffic yet.", cls="card-body form-help") if not paths else "",
+                    cls="card",
+                ),
+                Div(
+                    Div(H2("Referrers"), cls="card-head"),
+                    *[
+                        Div(Span(referrer), Strong(str(count)), cls="website-rank-row")
+                        for referrer, count in sorted(
+                            referrers.items(), key=lambda item: item[1], reverse=True
+                        )[:10]
+                    ],
+                    P("No referrers yet.", cls="card-body form-help") if not referrers else "",
+                    cls="card",
+                ),
+                cls="website-panels",
+            ),
+            Div(
+                H2("Tracking snippet"),
+                P(
+                    f"Add this once before </body> on {selected.domain}. No cookies or IP addresses are stored."
+                ),
+                Textarea(snippet, readonly=True, rows="3", cls="tracking-snippet"),
+                cls="card website-snippet-card",
+            ),
+        )
+    create_form = Form(
+        csrf_input(sess),
+        Div(
+            Label("Site name"),
+            Input(name="name", placeholder="Company website", required=True),
+            cls="field",
+        ),
+        Div(
+            Label("Domain"),
+            Input(name="domain", placeholder="example.com", required=True),
+            cls="field",
+        ),
+        Button("Add website", type="submit", cls="btn primary"),
+        method="post",
+        action="/websites",
+        cls="card website-create-form",
+    )
+    return _app_page(
+        ctx,
+        "Websites",
+        "/websites",
+        flash("Website analytics updated." if saved else ""),
+        flash(error, "error"),
+        page_intro(
+            "REAL-TIME WEB ANALYTICS",
+            "Connect content to outcomes.",
+            "Measure privacy-safe pageviews, visitors, referrers, and conversions beside social and Ads performance.",
+        ),
+        site_tabs if sites else "",
+        analytics,
+        Div(H2("Add a website"), cls="section-heading"),
+        create_form,
+    )
+
+
+@rt("/websites", methods=["POST"])
+async def website_create(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role == WorkspaceRole.viewer:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    name = str(form.get("name") or "").strip()
+    raw_domain = str(form.get("domain") or "").strip().lower()
+    parsed = urlparse(raw_domain if "://" in raw_domain else f"https://{raw_domain}")
+    domain = parsed.hostname or ""
+    if not name or not domain or "." not in domain:
+        return RedirectResponse("/websites?error=Enter+a+valid+name+and+domain", status_code=303)
+    try:
+        with session_scope() as session:
+            website = WebsiteSite(
+                workspace_id=ctx.workspace.id,
+                name=name,
+                domain=domain,
+                tracking_key=secrets.token_urlsafe(24),
+                created_by=ctx.user.id,
+            )
+            session.add(website)
+            session.flush()
+            audit(session, ctx.workspace.id, ctx.user.id, "website.created", website)
+            website_id = website.id
+        return RedirectResponse(f"/websites?site={website_id}&saved=1", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/websites?error={quote_plus(str(exc))}", status_code=303)
+
+
+TRACKING_PIXEL = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+
+
+@rt("/track/{tracking_key}.gif")
+def website_track(
+    tracking_key: str,
+    p: str = "/",
+    r: str = "",
+    v: str = "",
+    e: str = "pageview",
+):
+    with session_scope() as session:
+        site = session.scalar(
+            select(WebsiteSite).where(
+                WebsiteSite.tracking_key == tracking_key,
+                WebsiteSite.active.is_(True),
+            )
+        )
+        if site:
+            referrer = urlparse(r).hostname or "" if r else ""
+            visitor_hash = (
+                hashlib.sha256(f"{settings().app_secret}:{site.id}:{v}".encode()).hexdigest()
+                if v
+                else ""
+            )
+            session.add(
+                WebsiteEvent(
+                    site_id=site.id,
+                    path=(p or "/")[:1000],
+                    referrer_domain=referrer[:255],
+                    visitor_hash=visitor_hash,
+                    event_type=e if e in {"pageview", "conversion"} else "pageview",
+                )
+            )
+    return Response(
+        TRACKING_PIXEL,
+        media_type="image/gif",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Access-Control-Allow-Origin": "*",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+        },
     )
 
 

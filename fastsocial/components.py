@@ -37,6 +37,8 @@ ICONS = {
     "posts": "≡",
     "media": "▧",
     "analytics": "⌁",
+    "listening": "◉",
+    "websites": "◇",
     "ads": "◈",
     "competitors": "◎",
     "inbox": "✉",
@@ -50,13 +52,39 @@ ICONS = {
     "chat": "✦",
 }
 
-PLATFORM_NAMES = {"x": "X", "linkedin": "LinkedIn", "bluesky": "Bluesky"}
-PLATFORM_MARKS = {"x": "X", "linkedin": "in", "bluesky": "☁"}
+PLATFORM_NAMES = {
+    "x": "X",
+    "linkedin": "LinkedIn",
+    "bluesky": "Bluesky",
+    "facebook": "Facebook",
+    "instagram": "Instagram",
+    "threads": "Threads",
+    "tiktok": "TikTok",
+    "youtube": "YouTube",
+    "pinterest": "Pinterest",
+    "google_business": "Google Business",
+    "twitch": "Twitch",
+}
+PLATFORM_MARKS = {
+    "x": "X",
+    "linkedin": "in",
+    "bluesky": "☁",
+    "facebook": "f",
+    "instagram": "◎",
+    "threads": "@",
+    "tiktok": "♪",
+    "youtube": "▶",
+    "pinterest": "P",
+    "google_business": "G",
+    "twitch": "T",
+    "meta": "M",
+    "google": "G",
+}
 
 
 def head(title: str):
     description = (
-        "Plan, schedule, publish, and measure content across X, LinkedIn, and Bluesky "
+        "Plan, schedule, publish, listen, and measure content across every major social network "
         "from a private personal-first workspace."
     )
     return Head(
@@ -121,6 +149,8 @@ def sidebar(
         ("Posts", "/posts", "posts"),
         ("Media", "/media", "media"),
         ("Analytics", "/analytics", "analytics"),
+        ("Listening", "/listening", "listening"),
+        ("Websites", "/websites", "websites"),
         ("Ads", "/ads", "ads"),
         ("Competitors", "/competitors", "competitors"),
         ("Inbox", "/inbox", "inbox"),

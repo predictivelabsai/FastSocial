@@ -204,7 +204,9 @@ Return only one JSON object with these keys:
 - video_prompt: production-ready short video prompt
 - review: object with summary and risks array
 
-Hard limits: X 280 characters; Bluesky 300 characters. LinkedIn should remain concise.
+Respect each selected network's native format and limits. Hard limits: X 280 characters;
+Bluesky 300; Threads 500; Instagram and TikTok captions 2,200; Pinterest 500 characters.
+LinkedIn, Facebook, YouTube, and Google Business should remain concise and useful.
 The publisher is deterministic and outside your control. You may prepare content but never claim
 that it has already been posted.
 

@@ -19,10 +19,16 @@ from fastsocial.db import session_scope
 from fastsocial.models import (
     AccountMetricDaily,
     AccountStatus,
+    AdCampaignDaily,
     AuditLog,
+    CollectionRun,
+    CompetitorMetricDaily,
+    CompetitorProfile,
     ContentAutolist,
     InboxConversation,
     InboxMessage,
+    ListeningMention,
+    ListeningQuery,
     Media,
     Post,
     PostMedia,
@@ -43,7 +49,18 @@ from fastsocial.storage import media_storage, object_key
 
 log = logging.getLogger(__name__)
 
-PLATFORM_LIMITS = {"x": 280, "linkedin": 3000, "bluesky": 300}
+PLATFORM_LIMITS = {
+    "x": 280,
+    "linkedin": 3000,
+    "bluesky": 300,
+    "facebook": 63206,
+    "instagram": 2200,
+    "threads": 500,
+    "tiktok": 2200,
+    "youtube": 5000,
+    "pinterest": 500,
+    "google_business": 1500,
+}
 ALLOWED_MEDIA_TYPES = {
     "image/jpeg",
     "image/png",
@@ -538,6 +555,305 @@ async def send_inbox_reply(
     if failure:
         raise SocialAPIError(str(failure)) from failure
     return result
+
+
+async def collect_provider_inbox(workspace_id: uuid.UUID | None = None) -> int:
+    since = utcnow() - timedelta(days=7)
+    written = 0
+    with session_scope() as session:
+        query = select(SocialAccount).where(SocialAccount.status == AccountStatus.connected)
+        if workspace_id:
+            query = query.where(SocialAccount.workspace_id == workspace_id)
+        accounts = list(session.scalars(query))
+        for account in accounts:
+            collector = getattr(client_for(account), "collect_inbox", None)
+            if not collector:
+                continue
+            run = CollectionRun(
+                workspace_id=account.workspace_id,
+                social_account_id=account.id,
+                collector_kind="inbox",
+            )
+            session.add(run)
+            session.flush()
+            try:
+                items = await collector(account, since)
+                run.records_seen = len(items)
+                for item in items:
+                    if not item.message_id or not item.conversation_id:
+                        continue
+                    conversation = session.scalar(
+                        select(InboxConversation).where(
+                            InboxConversation.workspace_id == account.workspace_id,
+                            InboxConversation.platform == account.platform,
+                            InboxConversation.external_conversation_id == item.conversation_id,
+                        )
+                    )
+                    if not conversation:
+                        conversation = InboxConversation(
+                            workspace_id=account.workspace_id,
+                            social_account_id=account.id,
+                            platform=account.platform,
+                            external_conversation_id=item.conversation_id,
+                            kind=item.kind[:40],
+                            participant_name=item.participant_name[:255],
+                            participant_handle=item.participant_handle[:255],
+                            status="unread",
+                        )
+                        session.add(conversation)
+                        session.flush()
+                    exists = session.scalar(
+                        select(InboxMessage.id).where(
+                            InboxMessage.conversation_id == conversation.id,
+                            InboxMessage.external_message_id == item.message_id,
+                        )
+                    )
+                    if exists:
+                        continue
+                    session.add(
+                        InboxMessage(
+                            conversation_id=conversation.id,
+                            external_message_id=item.message_id,
+                            direction="inbound",
+                            sender_name=item.participant_name or item.participant_handle,
+                            body=item.body,
+                            delivery_status="received",
+                            sent_at=item.sent_at,
+                            message_metadata=item.raw,
+                        )
+                    )
+                    conversation.social_account_id = account.id
+                    conversation.kind = item.kind[:40]
+                    conversation.participant_name = item.participant_name[:255]
+                    conversation.participant_handle = item.participant_handle[:255]
+                    conversation.last_message_preview = item.body[:500]
+                    conversation.last_message_at = item.sent_at
+                    if conversation.status == "resolved":
+                        conversation.status = "unread"
+                    run.records_written += 1
+                    written += 1
+                run.status = "success"
+            except Exception as exc:  # noqa: BLE001
+                run.status = "failed"
+                run.error_message = str(exc)
+                log.exception("Inbox collection failed for %s", account.id)
+            run.completed_at = utcnow()
+    return written
+
+
+async def collect_provider_ads(workspace_id: uuid.UUID | None = None) -> int:
+    until = date.today()
+    since = until - timedelta(days=7)
+    written = 0
+    with session_scope() as session:
+        query = select(SocialAccount).where(SocialAccount.status == AccountStatus.connected)
+        if workspace_id:
+            query = query.where(SocialAccount.workspace_id == workspace_id)
+        accounts = list(session.scalars(query))
+        for account in accounts:
+            collector = getattr(client_for(account), "collect_ads", None)
+            if not collector:
+                continue
+            run = CollectionRun(
+                workspace_id=account.workspace_id,
+                social_account_id=account.id,
+                collector_kind="ads",
+            )
+            session.add(run)
+            session.flush()
+            try:
+                items = await collector(account, since, until)
+                run.records_seen = len(items)
+                for item in items:
+                    row = session.scalar(
+                        select(AdCampaignDaily).where(
+                            AdCampaignDaily.workspace_id == account.workspace_id,
+                            AdCampaignDaily.platform == item.platform,
+                            AdCampaignDaily.external_campaign_id == item.campaign_id,
+                            AdCampaignDaily.metric_date == item.metric_date,
+                        )
+                    )
+                    if not row:
+                        row = AdCampaignDaily(
+                            workspace_id=account.workspace_id,
+                            social_account_id=account.id,
+                            platform=item.platform,
+                            external_campaign_id=item.campaign_id,
+                            campaign_name=item.campaign_name,
+                            metric_date=item.metric_date,
+                        )
+                        session.add(row)
+                    row.social_account_id = account.id
+                    row.campaign_name = item.campaign_name
+                    row.status = item.status
+                    row.currency = item.currency
+                    row.spend = item.spend
+                    row.impressions = item.impressions
+                    row.clicks = item.clicks
+                    row.conversions = item.conversions
+                    row.revenue = item.revenue
+                    row.raw = item.raw
+                    row.collected_at = utcnow()
+                    run.records_written += 1
+                    written += 1
+                run.status = "success"
+            except Exception as exc:  # noqa: BLE001
+                run.status = "failed"
+                run.error_message = str(exc)
+                log.exception("Ads collection failed for %s", account.id)
+            run.completed_at = utcnow()
+    return written
+
+
+async def collect_provider_competitors(workspace_id: uuid.UUID | None = None) -> int:
+    until = date.today()
+    since = until - timedelta(days=7)
+    written = 0
+    with session_scope() as session:
+        query = select(SocialAccount).where(SocialAccount.status == AccountStatus.connected)
+        if workspace_id:
+            query = query.where(SocialAccount.workspace_id == workspace_id)
+        accounts = list(session.scalars(query))
+        for account in accounts:
+            profiles = list(
+                session.scalars(
+                    select(CompetitorProfile).where(
+                        CompetitorProfile.workspace_id == account.workspace_id,
+                        CompetitorProfile.platform == account.platform,
+                        CompetitorProfile.active.is_(True),
+                    )
+                )
+            )
+            collector = getattr(client_for(account), "collect_competitors", None)
+            if not collector or not profiles:
+                continue
+            by_handle = {item.handle.lstrip("@").lower(): item for item in profiles}
+            run = CollectionRun(
+                workspace_id=account.workspace_id,
+                social_account_id=account.id,
+                collector_kind="competitors",
+            )
+            session.add(run)
+            session.flush()
+            try:
+                items = await collector(account, list(by_handle), since, until)
+                run.records_seen = len(items)
+                for item in items:
+                    profile = by_handle.get(item.handle.lstrip("@").lower())
+                    if not profile:
+                        continue
+                    row = session.scalar(
+                        select(CompetitorMetricDaily).where(
+                            CompetitorMetricDaily.competitor_id == profile.id,
+                            CompetitorMetricDaily.metric_date == item.metric_date,
+                        )
+                    )
+                    if not row:
+                        row = CompetitorMetricDaily(
+                            competitor_id=profile.id, metric_date=item.metric_date
+                        )
+                        session.add(row)
+                    row.followers = item.followers
+                    row.posts = item.posts
+                    row.engagement = item.engagement
+                    row.reach = item.reach
+                    row.engagement_rate = item.engagement_rate
+                    row.raw = item.raw
+                    row.collected_at = utcnow()
+                    run.records_written += 1
+                    written += 1
+                run.status = "success"
+            except Exception as exc:  # noqa: BLE001
+                run.status = "failed"
+                run.error_message = str(exc)
+                log.exception("Competitor collection failed for %s", account.id)
+            run.completed_at = utcnow()
+    return written
+
+
+async def collect_provider_listening(workspace_id: uuid.UUID | None = None) -> int:
+    since = utcnow() - timedelta(days=7)
+    written = 0
+    with session_scope() as session:
+        query = select(SocialAccount).where(SocialAccount.status == AccountStatus.connected)
+        if workspace_id:
+            query = query.where(SocialAccount.workspace_id == workspace_id)
+        accounts = list(session.scalars(query))
+        for account in accounts:
+            definitions = list(
+                session.scalars(
+                    select(ListeningQuery).where(
+                        ListeningQuery.workspace_id == account.workspace_id,
+                        ListeningQuery.active.is_(True),
+                    )
+                )
+            )
+            definitions = [
+                item
+                for item in definitions
+                if not item.platforms or account.platform in item.platforms
+            ]
+            collector = getattr(client_for(account), "collect_listening", None)
+            if not collector or not definitions:
+                continue
+            by_query = {item.query.lower(): item for item in definitions}
+            run = CollectionRun(
+                workspace_id=account.workspace_id,
+                social_account_id=account.id,
+                collector_kind="listening",
+            )
+            session.add(run)
+            session.flush()
+            try:
+                items = await collector(account, [item.query for item in definitions], since)
+                run.records_seen = len(items)
+                for item in items:
+                    definition = by_query.get(item.query.lower())
+                    if not definition:
+                        continue
+                    exists = session.scalar(
+                        select(ListeningMention.id).where(
+                            ListeningMention.query_id == definition.id,
+                            ListeningMention.platform == item.platform,
+                            ListeningMention.external_mention_id == item.external_id,
+                        )
+                    )
+                    if exists:
+                        continue
+                    session.add(
+                        ListeningMention(
+                            query_id=definition.id,
+                            platform=item.platform,
+                            external_mention_id=item.external_id,
+                            author_name=item.author_name[:255],
+                            author_handle=item.author_handle[:255],
+                            content=item.content,
+                            url=item.url,
+                            sentiment=item.sentiment,
+                            reach=item.reach,
+                            engagement=item.engagement,
+                            published_at=item.published_at,
+                            raw=item.raw,
+                        )
+                    )
+                    run.records_written += 1
+                    written += 1
+                run.status = "success"
+            except Exception as exc:  # noqa: BLE001
+                run.status = "failed"
+                run.error_message = str(exc)
+                log.exception("Listening collection failed for %s", account.id)
+            run.completed_at = utcnow()
+    return written
+
+
+async def collect_live_data(workspace_id: uuid.UUID | None = None) -> dict[str, int]:
+    return {
+        "inbox": await collect_provider_inbox(workspace_id),
+        "ads": await collect_provider_ads(workspace_id),
+        "competitors": await collect_provider_competitors(workspace_id),
+        "listening": await collect_provider_listening(workspace_id),
+    }
 
 
 async def collect_metrics() -> int:

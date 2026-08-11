@@ -104,5 +104,5 @@ jobs:
             --connect-timeout 10 --max-time 30 \
             --retry 12 --retry-delay 5 --retry-all-errors \
             https://fastsocial.org/healthz)
-          jq -e '.status == "ok" and .service == "fastsocial" and .version == "0.3.0"' \
+          jq -e '.status == "ok" and .service == "fastsocial" and .version == "0.4.0"' \
             <<<"$response"

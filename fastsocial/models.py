@@ -606,6 +606,127 @@ class AdCampaignDaily(Base):
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class CollectionRun(Base):
+    __tablename__ = "collection_runs"
+    __table_args__ = (
+        Index("ix_collection_runs_workspace_started", "workspace_id", "started_at"),
+        Index("ix_collection_runs_account_kind", "social_account_id", "collector_kind"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    social_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("social_accounts.id", ondelete="SET NULL"), index=True
+    )
+    collector_kind: Mapped[str] = mapped_column(String(40), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="running", index=True)
+    records_seen: Mapped[int] = mapped_column(Integer, default=0)
+    records_written: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ListeningQuery(Base):
+    __tablename__ = "listening_queries"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "query"),
+        Index("ix_listening_queries_workspace_active", "workspace_id", "active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(160))
+    query: Mapped[str] = mapped_column(String(500))
+    kind: Mapped[str] = mapped_column(String(30), default="keyword")
+    platforms: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    mentions: Mapped[list[ListeningMention]] = relationship(
+        back_populates="query_definition", cascade="all, delete-orphan"
+    )
+
+
+class ListeningMention(Base):
+    __tablename__ = "listening_mentions"
+    __table_args__ = (
+        UniqueConstraint("query_id", "platform", "external_mention_id"),
+        Index("ix_listening_mentions_query_published", "query_id", "published_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    query_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("listening_queries.id", ondelete="CASCADE"), index=True
+    )
+    platform: Mapped[str] = mapped_column(String(40), index=True)
+    external_mention_id: Mapped[str] = mapped_column(String(500))
+    author_name: Mapped[str] = mapped_column(String(255), default="")
+    author_handle: Mapped[str] = mapped_column(String(255), default="")
+    content: Mapped[str] = mapped_column(Text)
+    url: Mapped[str] = mapped_column(Text, default="")
+    sentiment: Mapped[str] = mapped_column(String(20), default="neutral", index=True)
+    reach: Mapped[int] = mapped_column(BigInteger, default=0)
+    engagement: Mapped[int] = mapped_column(BigInteger, default=0)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    query_definition: Mapped[ListeningQuery] = relationship(back_populates="mentions")
+
+
+class WebsiteSite(Base):
+    __tablename__ = "website_sites"
+    __table_args__ = (UniqueConstraint("workspace_id", "domain"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(160))
+    domain: Mapped[str] = mapped_column(String(255))
+    tracking_key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    events: Mapped[list[WebsiteEvent]] = relationship(
+        back_populates="site", cascade="all, delete-orphan"
+    )
+
+
+class WebsiteEvent(Base):
+    __tablename__ = "website_events"
+    __table_args__ = (
+        Index("ix_website_events_site_occurred", "site_id", "occurred_at"),
+        Index("ix_website_events_site_visitor", "site_id", "visitor_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    site_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("website_sites.id", ondelete="CASCADE"), index=True
+    )
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    path: Mapped[str] = mapped_column(String(1000), default="/")
+    referrer_domain: Mapped[str] = mapped_column(String(255), default="")
+    visitor_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    event_type: Mapped[str] = mapped_column(String(40), default="pageview", index=True)
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    site: Mapped[WebsiteSite] = relationship(back_populates="events")
+
+
 class SmartLinkPage(Base):
     __tablename__ = "smartlink_pages"
     __table_args__ = (Index("ix_smartlink_workspace_created", "workspace_id", "created_at"),)

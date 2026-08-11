@@ -10,6 +10,10 @@ from fastsocial.reporting import run_due_reports
 from fastsocial.services import (
     check_account_health,
     collect_metrics,
+    collect_provider_ads,
+    collect_provider_competitors,
+    collect_provider_inbox,
+    collect_provider_listening,
     process_due_autolists,
     publish_due_posts,
     run_async,
@@ -42,6 +46,38 @@ def scheduler() -> BackgroundScheduler:
         "interval",
         minutes=15,
         id="run_due_reports",
+        max_instances=1,
+        coalesce=True,
+    )
+    value.add_job(
+        lambda: run_async(collect_provider_inbox()),
+        "interval",
+        minutes=10,
+        id="collect_provider_inbox",
+        max_instances=1,
+        coalesce=True,
+    )
+    value.add_job(
+        lambda: run_async(collect_provider_ads()),
+        "interval",
+        hours=1,
+        id="collect_provider_ads",
+        max_instances=1,
+        coalesce=True,
+    )
+    value.add_job(
+        lambda: run_async(collect_provider_competitors()),
+        "interval",
+        hours=1,
+        id="collect_provider_competitors",
+        max_instances=1,
+        coalesce=True,
+    )
+    value.add_job(
+        lambda: run_async(collect_provider_listening()),
+        "interval",
+        minutes=30,
+        id="collect_provider_listening",
         max_instances=1,
         coalesce=True,
     )

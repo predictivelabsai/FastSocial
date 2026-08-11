@@ -1,8 +1,9 @@
 # FastSocial
 
 FastSocial is a personal-first, team-ready social media management system built with Python,
-FastHTML, HTMX, PostgreSQL, and Cloudflare R2. It schedules and publishes to X, LinkedIn, and
-Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateways.
+FastHTML, HTMX, PostgreSQL, and Cloudflare R2. It publishes directly to X, LinkedIn, and Bluesky,
+and supports Facebook, Instagram, Threads, TikTok, YouTube, Pinterest, Google Business, and Twitch
+through configurable Arcade/Composio MCP gateways.
 
 ## What is included
 
@@ -10,6 +11,7 @@ Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateway
 - Isolated workspaces with owner, admin, editor, and viewer roles
 - FastVC-style left navigation and a dedicated integration status page
 - Direct, Arcade MCP, and Composio MCP connection paths per social account
+- Capability-level MCP mappings for publishing, metrics, Inbox, Ads, competitors, and listening
 - Encrypted credentials and OAuth tokens
 - Multi-account composer, drafts, scheduling, and month/week/list planner views with drag rescheduling
 - Evergreen Autolists with daily, weekly, or monthly round-robin publishing
@@ -20,6 +22,9 @@ Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateway
 - Competitor profiles with historical growth/engagement snapshots and export
 - Unified brand reports with printable/R2 artifacts, scheduled runs, and optional Postmark delivery
 - Meta, Google, and TikTok Ads campaign snapshots with spend, CPC, conversion, ROAS, and CSV export
+- Scheduled live provider collectors with per-account run history and exact failure visibility
+- Keyword/hashtag listening with reach, engagement, sentiment, and direct X recent-search support
+- Privacy-safe real-time website analytics for pageviews, visitors, referrers, and conversions
 - Public SmartLinks with themes plus live view and click measurement
 - Tenant-safe unified inbox with assignment, priority, resolution, saved replies, and provider dispatch
 - Personal publishing without approval; optional team approval workflow
@@ -67,8 +72,8 @@ the deterministic mock provider and cannot post to a real network.
 three-legged OAuth, and Bluesky uses a dedicated app password.
 
 `arcade` and `composio` store only managed account/tool identifiers. FastSocial calls a configured
-MCP gateway; the provider owns downstream authorization and refresh. Configure tool names on the
-integration page because gateway catalog names are deployment-specific.
+MCP gateway; the provider owns downstream authorization and refresh. Configure each supported tool
+name independently on the integration page because gateway catalog names are deployment-specific.
 
 Current reference documentation:
 

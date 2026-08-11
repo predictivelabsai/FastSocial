@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import time
-from datetime import UTC, date
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -11,7 +11,13 @@ import httpx
 from fastsocial.config import settings
 from fastsocial.models import SocialAccount
 from fastsocial.security import decrypt_text, encrypt_text
-from fastsocial.social.base import NormalizedMetrics, PublishResult, SocialAPIError
+from fastsocial.social.base import (
+    InboxItem,
+    ListeningItem,
+    NormalizedMetrics,
+    PublishResult,
+    SocialAPIError,
+)
 from fastsocial.storage import media_storage
 
 
@@ -60,6 +66,22 @@ class MockClient:
     ) -> str:
         seed = f"{account.id}:{conversation_id}:{body}:{time.time_ns()}"
         return "mock_reply_" + hashlib.sha256(seed.encode()).hexdigest()[:18]
+
+    async def collect_inbox(self, account: SocialAccount, since: datetime) -> list[InboxItem]:
+        return []
+
+    async def collect_ads(self, account: SocialAccount, since: date, until: date) -> list:
+        return []
+
+    async def collect_competitors(
+        self, account: SocialAccount, handles: list[str], since: date, until: date
+    ) -> list:
+        return []
+
+    async def collect_listening(
+        self, account: SocialAccount, queries: list[str], since: datetime
+    ) -> list[ListeningItem]:
+        return []
 
 
 class XClient:
@@ -187,6 +209,127 @@ class XClient:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.get(f"{self.base_url}/users/me", headers=self._headers(account))
         return {"ok": response.is_success, "status_code": response.status_code}
+
+    async def collect_inbox(self, account: SocialAccount, since: datetime) -> list[InboxItem]:
+        await self._ensure_token(account)
+        params = {
+            "max_results": 100,
+            "tweet.fields": "author_id,conversation_id,created_at,referenced_tweets",
+            "expansions": "author_id",
+            "user.fields": "name,username",
+        }
+        newest_id = account.account_metadata.get("inbox_newest_id")
+        if newest_id:
+            params["since_id"] = newest_id
+        else:
+            params["start_time"] = since.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}/users/{account.external_account_id}/mentions",
+                headers=self._headers(account),
+                params=params,
+            )
+        _raise(response)
+        body = response.json()
+        users = {item["id"]: item for item in body.get("includes", {}).get("users", [])}
+        items = []
+        for item in body.get("data", []):
+            author = users.get(item.get("author_id"), {})
+            references = item.get("referenced_tweets") or []
+            kind = (
+                "comment"
+                if any(ref.get("type") == "replied_to" for ref in references)
+                else "mention"
+            )
+            created = datetime.fromisoformat(
+                str(item.get("created_at") or datetime.now(UTC).isoformat()).replace("Z", "+00:00")
+            )
+            items.append(
+                InboxItem(
+                    conversation_id=str(item["id"]),
+                    message_id=str(item["id"]),
+                    kind=kind,
+                    body=str(item.get("text") or ""),
+                    sent_at=created,
+                    participant_name=str(author.get("name") or ""),
+                    participant_handle=str(author.get("username") or ""),
+                    raw=item,
+                )
+            )
+        if body.get("meta", {}).get("newest_id"):
+            account.account_metadata = {
+                **account.account_metadata,
+                "inbox_newest_id": body["meta"]["newest_id"],
+            }
+        return items
+
+    async def reply_to_conversation(
+        self, account: SocialAccount, conversation_id: str, body: str, kind: str
+    ) -> str:
+        await self._ensure_token(account)
+        payload = {"text": body, "reply": {"in_reply_to_tweet_id": conversation_id}}
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.base_url}/tweets", headers=self._headers(account), json=payload
+            )
+        _raise(response)
+        message_id = str(response.json().get("data", {}).get("id") or "")
+        if not message_id:
+            raise SocialAPIError("X reply did not return a post ID")
+        return message_id
+
+    async def collect_listening(
+        self, account: SocialAccount, queries: list[str], since: datetime
+    ) -> list[ListeningItem]:
+        await self._ensure_token(account)
+        output = []
+        for query in queries:
+            params = {
+                "query": query,
+                "max_results": 25,
+                "start_time": since.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "tweet.fields": "author_id,created_at,public_metrics",
+                "expansions": "author_id",
+                "user.fields": "name,username,public_metrics",
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.base_url}/tweets/search/recent",
+                    headers=self._headers(account),
+                    params=params,
+                )
+            _raise(response)
+            body = response.json()
+            users = {item["id"]: item for item in body.get("includes", {}).get("users", [])}
+            for item in body.get("data", []):
+                author = users.get(item.get("author_id"), {})
+                metrics = item.get("public_metrics") or {}
+                username = str(author.get("username") or "")
+                output.append(
+                    ListeningItem(
+                        query=query,
+                        platform="x",
+                        external_id=str(item["id"]),
+                        content=str(item.get("text") or ""),
+                        published_at=datetime.fromisoformat(
+                            str(item.get("created_at") or datetime.now(UTC).isoformat()).replace(
+                                "Z", "+00:00"
+                            )
+                        ),
+                        author_name=str(author.get("name") or ""),
+                        author_handle=username,
+                        url=f"https://x.com/{username}/status/{item['id']}" if username else "",
+                        reach=int(author.get("public_metrics", {}).get("followers_count") or 0),
+                        engagement=int(
+                            metrics.get("like_count", 0)
+                            + metrics.get("reply_count", 0)
+                            + metrics.get("retweet_count", 0)
+                            + metrics.get("quote_count", 0)
+                        ),
+                        raw=item,
+                    )
+                )
+        return output
 
 
 class LinkedInClient:

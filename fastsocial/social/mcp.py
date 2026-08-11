@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 
 import httpx
 
 from fastsocial.config import settings
 from fastsocial.models import ConnectionProvider, SocialAccount
-from fastsocial.social.base import NormalizedMetrics, PublishResult, SocialAPIError
+from fastsocial.social.base import (
+    AdMetricItem,
+    CompetitorMetricItem,
+    InboxItem,
+    ListeningItem,
+    NormalizedMetrics,
+    PublishResult,
+    SocialAPIError,
+)
 
 
 class ManagedMCPClient:
@@ -64,6 +72,35 @@ class ManagedMCPClient:
         if body.get("error"):
             raise SocialAPIError(f"MCP tool error: {body['error']}")
         return body.get("result", body)
+
+    @staticmethod
+    def _records(body: dict, preferred_key: str) -> list[dict]:
+        """Accept common MCP structured and text-content result envelopes."""
+        candidate = body.get("structuredContent", body)
+        if isinstance(candidate, dict):
+            for key in (preferred_key, "items", "data", "results"):
+                if isinstance(candidate.get(key), list):
+                    return [item for item in candidate[key] if isinstance(item, dict)]
+        for item in body.get("content", []) if isinstance(body, dict) else []:
+            if item.get("type") != "text":
+                continue
+            try:
+                parsed = json.loads(item.get("text", ""))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, list):
+                return [value for value in parsed if isinstance(value, dict)]
+            if isinstance(parsed, dict):
+                return ManagedMCPClient._records(parsed, preferred_key)
+        return []
+
+    @staticmethod
+    def _datetime(value: object) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            return datetime.now(UTC)
 
     async def publish(
         self, account: SocialAccount, content: dict, media: list[dict]
@@ -152,3 +189,154 @@ class ManagedMCPClient:
         if not message_id:
             raise SocialAPIError("MCP inbox tool did not return a message ID")
         return message_id
+
+    async def collect_inbox(self, account: SocialAccount, since: datetime) -> list[InboxItem]:
+        tool = account.account_metadata.get("inbox_collect_tool")
+        if not tool:
+            return []
+        result = await self._call(
+            account,
+            tool,
+            {"account_id": account.external_account_id, "since": since.isoformat()},
+        )
+        return [
+            InboxItem(
+                conversation_id=str(
+                    item.get("conversation_id") or item.get("thread_id") or item.get("id") or ""
+                ),
+                message_id=str(item.get("message_id") or item.get("id") or ""),
+                kind=str(item.get("kind") or item.get("type") or "comment"),
+                body=str(item.get("body") or item.get("text") or ""),
+                sent_at=self._datetime(item.get("sent_at") or item.get("created_at")),
+                participant_name=str(item.get("participant_name") or item.get("author_name") or ""),
+                participant_handle=str(
+                    item.get("participant_handle") or item.get("author_handle") or ""
+                ),
+                raw=item,
+            )
+            for item in self._records(result, "messages")
+            if item.get("message_id") or item.get("id")
+        ]
+
+    async def collect_ads(
+        self, account: SocialAccount, since: date, until: date
+    ) -> list[AdMetricItem]:
+        tool = account.account_metadata.get("ads_metrics_tool")
+        if not tool:
+            return []
+        result = await self._call(
+            account,
+            tool,
+            {
+                "account_id": account.external_account_id,
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+            },
+        )
+        output = []
+        for item in self._records(result, "campaigns"):
+            campaign_id = str(item.get("campaign_id") or item.get("id") or "")
+            if not campaign_id:
+                continue
+            try:
+                metric_date = date.fromisoformat(str(item.get("date") or until.isoformat())[:10])
+            except ValueError:
+                metric_date = until
+            output.append(
+                AdMetricItem(
+                    platform=str(item.get("platform") or account.platform),
+                    campaign_id=campaign_id,
+                    campaign_name=str(item.get("campaign_name") or item.get("name") or campaign_id),
+                    metric_date=metric_date,
+                    currency=str(item.get("currency") or "EUR")[:3].upper(),
+                    status=str(item.get("status") or "active"),
+                    spend=float(item.get("spend") or 0),
+                    impressions=int(item.get("impressions") or 0),
+                    clicks=int(item.get("clicks") or 0),
+                    conversions=float(item.get("conversions") or 0),
+                    revenue=float(item.get("revenue") or item.get("conversion_value") or 0),
+                    raw=item,
+                )
+            )
+        return output
+
+    async def collect_competitors(
+        self, account: SocialAccount, handles: list[str], since: date, until: date
+    ) -> list[CompetitorMetricItem]:
+        tool = account.account_metadata.get("competitor_metrics_tool")
+        if not tool or not handles:
+            return []
+        result = await self._call(
+            account,
+            tool,
+            {
+                "account_id": account.external_account_id,
+                "handles": handles,
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+            },
+        )
+        output = []
+        for item in self._records(result, "profiles"):
+            handle = str(item.get("handle") or item.get("username") or "").lstrip("@").lower()
+            if not handle:
+                continue
+            try:
+                metric_date = date.fromisoformat(str(item.get("date") or until.isoformat())[:10])
+            except ValueError:
+                metric_date = until
+            output.append(
+                CompetitorMetricItem(
+                    handle=handle,
+                    metric_date=metric_date,
+                    followers=int(item.get("followers") or 0),
+                    posts=int(item.get("posts") or item.get("post_count") or 0),
+                    engagement=int(item.get("engagement") or item.get("engagements") or 0),
+                    reach=int(item.get("reach") or 0),
+                    engagement_rate=float(item.get("engagement_rate") or 0),
+                    raw=item,
+                )
+            )
+        return output
+
+    async def collect_listening(
+        self, account: SocialAccount, queries: list[str], since: datetime
+    ) -> list[ListeningItem]:
+        tool = account.account_metadata.get("listening_tool")
+        if not tool or not queries:
+            return []
+        result = await self._call(
+            account,
+            tool,
+            {
+                "account_id": account.external_account_id,
+                "queries": queries,
+                "since": since.isoformat(),
+            },
+        )
+        output = []
+        for item in self._records(result, "mentions"):
+            external_id = str(item.get("mention_id") or item.get("post_id") or item.get("id") or "")
+            query = str(item.get("query") or "")
+            if not external_id or not query:
+                continue
+            sentiment = str(item.get("sentiment") or "neutral").lower()
+            if sentiment not in {"positive", "neutral", "negative"}:
+                sentiment = "neutral"
+            output.append(
+                ListeningItem(
+                    query=query,
+                    platform=str(item.get("platform") or account.platform),
+                    external_id=external_id,
+                    content=str(item.get("content") or item.get("text") or ""),
+                    published_at=self._datetime(item.get("published_at") or item.get("created_at")),
+                    author_name=str(item.get("author_name") or ""),
+                    author_handle=str(item.get("author_handle") or item.get("username") or ""),
+                    url=str(item.get("url") or ""),
+                    sentiment=sentiment,
+                    reach=int(item.get("reach") or 0),
+                    engagement=int(item.get("engagement") or item.get("engagements") or 0),
+                    raw=item,
+                )
+            )
+        return output

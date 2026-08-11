@@ -384,6 +384,34 @@ td { padding: 12px; border-top: 1px solid var(--line); vertical-align: middle; }
 .ads-import-form { padding: 18px; }
 .ads-import-grid { margin-bottom: 14px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
 
+.listening-query-grid { margin-bottom: 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.listening-query-card { padding: 15px; }
+.listening-query-card .integration-card-head > div { display: grid; gap: 3px; }
+.listening-query-card small { color: var(--muted); font-size: 9px; }
+.listening-platforms { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 5px; }
+.listening-feed { overflow: hidden; }
+.listening-mention { padding: 14px 16px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; border-top: 1px solid var(--line); }
+.listening-mention:first-child { border-top: 0; }
+.listening-mention > div:nth-child(2) { min-width: 0; display: grid; gap: 4px; }
+.listening-mention > div:nth-child(2) > div { display: flex; justify-content: space-between; gap: 10px; }
+.listening-mention p { margin: 0; font-size: 11px; line-height: 1.5; }
+.listening-mention small { color: var(--muted); font-size: 9px; }
+.listening-mention > div:last-child { display: grid; align-content: center; justify-items: end; gap: 7px; }
+.sentiment { padding: 4px 7px; border-radius: 10px; font-size: 8px; font-weight: 800; }
+.sentiment.positive { color: #1f7650; background: #e5f5ec; }
+.sentiment.neutral { color: #596a63; background: var(--soft); }
+.sentiment.negative { color: #a23c3c; background: #faeaea; }
+.listening-create-form { padding: 18px; display: grid; gap: 14px; }
+.listening-create-grid { display: grid; grid-template-columns: 1.2fr .7fr 1.5fr; gap: 12px; }
+
+.website-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.website-rank-row { padding: 10px 15px; display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); font-size: 10px; }
+.website-rank-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.website-snippet-card { margin-top: 14px; padding: 18px; }
+.website-snippet-card p { color: var(--muted); font-size: 10px; }
+.tracking-snippet { font-family: ui-monospace, monospace; font-size: 10px; }
+.website-create-form { padding: 18px; display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 12px; }
+
 .inbox-filters { margin-bottom: 12px; display: flex; gap: 6px; }
 .inbox-list { overflow: hidden; }
 .inbox-row { padding: 14px 17px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; border-top: 1px solid var(--line); }
@@ -509,7 +537,7 @@ td { padding: 12px; border-top: 1px solid var(--line); vertical-align: middle; }
   .creation-workspace { grid-template-columns: minmax(430px, 1fr) 340px; }
   .prompt-suggestions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .composer-controls-grid { grid-template-columns: 1fr; }
-  .planner-layout, .reports-layout, .smartlink-editor-layout, .inbox-detail-layout { grid-template-columns: 1fr; }
+  .planner-layout, .reports-layout, .smartlink-editor-layout, .inbox-detail-layout, .website-panels { grid-template-columns: 1fr; }
   .ads-import-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .best-times-card, .smartlink-preview-shell { position: static; }
   .competitor-add-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -540,7 +568,7 @@ td { padding: 12px; border-top: 1px solid var(--line); vertical-align: middle; }
   .calendar-head, .calendar-grid { min-width: 760px; }
   .planner-layout > :first-child { overflow-x: auto; }
   .planner-list-row { grid-template-columns: 1fr; gap: 6px; }
-  .autolist-create-grid, .ads-import-grid { grid-template-columns: 1fr; }
+  .autolist-create-grid, .ads-import-grid, .listening-create-grid, .website-create-form { grid-template-columns: 1fr; }
   .competitor-add-grid, .smartlink-create-form, .smartlink-item-form { grid-template-columns: 1fr; }
   .competitor-snapshot-form { grid-template-columns: 1fr; }
   .report-actions { justify-content: flex-start; }
