@@ -44,7 +44,20 @@ class Settings(BaseSettings):
 
     xai_api_key: str = Field("", alias="XAI_API_KEY")
     xai_base_url: str = Field("https://api.x.ai/v1", alias="XAI_BASE_URL")
-    xai_model: str = Field("grok-4-1-fast-reasoning", alias="XAI_MODEL")
+    xai_model: str = Field("grok-4.5", alias="XAI_MODEL")
+    openai_api_key: str = Field("", alias="OPENAI_API_KEY")
+    openai_base_url: str = Field("https://api.openai.com/v1", alias="OPENAI_BASE_URL")
+    openai_model: str = Field("gpt-5.6-terra", alias="OPENAI_MODEL")
+    model_provider: str = Field("xai", alias="MODEL_PROVIDER")
+    model_name: str = Field("grok-4.5", alias="MODEL_NAME")
+    image_model: str = Field("grok-imagine-image-quality", alias="IMAGE_MODEL")
+    video_model: str = Field("grok-imagine-video-1.5", alias="VIDEO_MODEL")
+    openai_image_model: str = Field("gpt-image-2", alias="OPENAI_IMAGE_MODEL")
+    openai_video_model: str = Field("sora-2-pro", alias="OPENAI_VIDEO_MODEL")
+    model_server_allowed_emails: str = Field(
+        "kaljuvee@gmail.com", alias="MODEL_SERVER_ALLOWED_EMAILS"
+    )
+    model_request_timeout: int = Field(300, alias="MODEL_REQUEST_TIMEOUT")
 
     x_client_id: str = Field("", alias="X_CLIENT_ID")
     x_client_secret: str = Field("", alias="X_CLIENT_SECRET")
@@ -85,6 +98,14 @@ class Settings(BaseSettings):
         normalized = email.strip().lower()
         domain = normalized.rsplit("@", 1)[-1]
         return normalized in allowed_emails or domain in allowed_domains
+
+    def server_model_access_allowed(self, email: str) -> bool:
+        allowed = {
+            item.strip().lower()
+            for item in self.model_server_allowed_emails.split(",")
+            if item.strip()
+        }
+        return email.strip().lower() in allowed
 
     def validate_security(self) -> None:
         if self.production and self.app_secret == "development-only-change-me":

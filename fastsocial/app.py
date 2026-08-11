@@ -39,6 +39,10 @@ def healthz():
 if settings().auto_create_schema:
     init_db()
 
+from fastsocial.skills_service import seed_skill_definitions  # noqa: E402
+
+seed_skill_definitions()
+
 from fastsocial import routes as _routes  # noqa: E402,F401
 
 app.routes.append(static_route)

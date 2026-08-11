@@ -17,7 +17,8 @@ def test_anonymous_landing_and_password_registration():
     with TestClient(app) as client:
         landing = client.get("/")
         assert landing.status_code == 200
-        assert "Plan your voice" in landing.text
+        assert "Your agentic social studio" in landing.text
+        assert "BYOK / BYOM" in landing.text
         assert 'href="/signin"' in landing.text
         assert "<script" not in landing.text.lower()
 
@@ -37,8 +38,65 @@ def test_anonymous_landing_and_password_registration():
         assert dashboard.status_code == 200
         assert "Dashboard" in dashboard.text
         assert "Integrations" in dashboard.text
+        assert "New Post" in dashboard.text
+        assert "CHAT HISTORY" in dashboard.text
         assert "app.js" not in dashboard.text
         assert "chart.js" not in dashboard.text.lower()
+
+        new_post = client.get("/new-post")
+        assert new_post.status_code == 200
+        assert "BYOK required" in new_post.text
+        assert "YOLO" in new_post.text
+
+        skills = client.get("/skills")
+        assert skills.status_code == 200
+        assert "editable marketing skills" in skills.text
+        assert len(BeautifulSoup(skills.text, "html.parser").select("a.skill-card")) >= 45
+
+        skill = client.get("/skills/social")
+        assert skill.status_code == 200
+        assert "skill-markdown" in skill.text
+        saved_skill = client.post(
+            "/skills/social",
+            data={"csrf": _csrf(skill), "content": "# Social\n\nUse evidence and be concise."},
+            follow_redirects=False,
+        )
+        assert saved_skill.status_code == 303
+
+        integrations = client.get("/integrations")
+        assert "BYOK / BYOM" in integrations.text
+        saved_model = client.post(
+            "/integrations/models",
+            data={
+                "csrf": _csrf(integrations),
+                "provider": "xai",
+                "api_key": "test-workspace-key",
+                "text_model": "grok-test",
+                "image_model": "grok-image-test",
+                "video_model": "grok-video-test",
+                "action": "save",
+            },
+            follow_redirects=False,
+        )
+        assert saved_model.status_code == 303
+        integrations = client.get("/integrations")
+        assert "••••-key" in integrations.text
+        assert "test-workspace-key" not in integrations.text
+
+        settings = client.get("/settings")
+        changed = client.post(
+            "/settings",
+            data={
+                "csrf": _csrf(settings),
+                "name": "Local User",
+                "workspace_name": "Local User's Workspace",
+                "timezone": "Europe/Tallinn",
+                "default_workflow_mode": "yolo",
+                "default_model_provider": "xai",
+            },
+        )
+        assert changed.status_code == 200
+        assert 'option value="yolo" selected' in changed.text
 
         connect = client.get("/integrations/connect/x/mock")
         assert connect.status_code == 200
@@ -49,24 +107,19 @@ def test_anonymous_landing_and_password_registration():
         )
         assert connected.status_code == 303
 
-        composer = client.get("/compose")
-        soup = BeautifulSoup(composer.text, "html.parser")
-        target = soup.select_one('input[name="target_ids"]')
-        assert target is not None
-        published = client.post(
+        agent_composer = client.get("/new-post")
+        agent_target = BeautifulSoup(agent_composer.text, "html.parser").select_one(
+            'input[name="target_ids"]'
+        )
+        assert agent_target is not None
+        assert agent_target.get("form") == "new-post-form"
+
+        legacy_composer = client.get(
             "/compose",
-            data={
-                "csrf": _csrf(composer),
-                "text": "Published through the safe local provider.",
-                "target_ids": target["value"],
-                "publish_mode": "now",
-                "action": "schedule",
-            },
             follow_redirects=False,
         )
-        assert published.status_code == 303
-        detail = client.get(published.headers["location"])
-        assert "Published" in detail.text
+        assert legacy_composer.status_code == 303
+        assert legacy_composer.headers["location"] == "/new-post"
 
 
 def test_health_and_static_css():

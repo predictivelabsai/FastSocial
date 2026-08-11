@@ -8,7 +8,7 @@ import io
 import secrets
 import uuid
 from datetime import UTC, date, datetime
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -20,18 +20,23 @@ from fasthtml.common import (
     Body,
     Br,
     Button,
+    Details,
     Div,
     Form,
     Html,
     Input,
     Label,
+    Li,
+    Link,
     NotStr,
     Option,
     P,
+    Script,
     Select,
     Small,
     Span,
     Strong,
+    Summary,
     Table,
     Tbody,
     Td,
@@ -39,12 +44,19 @@ from fasthtml.common import (
     Th,
     Thead,
     Tr,
+    Ul,
 )
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import selectinload
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
-from fastsocial.ai import generate_variants
+from fastsocial.agentic import (
+    create_chat_session,
+    generate_chat_artifact,
+    generate_media_for_chat,
+    latest_artifact,
+    record_event,
+)
 from fastsocial.app import rt
 from fastsocial.components import (
     PLATFORM_MARKS,
@@ -63,24 +75,43 @@ from fastsocial.components import (
 )
 from fastsocial.config import settings
 from fastsocial.db import session_scope
+from fastsocial.model_provider import (
+    default_model,
+    invoke_json,
+    resolve_model,
+    test_model_connection,
+)
 from fastsocial.models import (
     AccountMetricDaily,
     AccountStatus,
+    AgentEvent,
+    AIProviderCredential,
     ApprovalStatus,
+    ArtifactStatus,
     AuditLog,
+    ChatMessage,
+    ChatRole,
+    ChatSession,
     ConnectionProvider,
+    ContentArtifact,
     Media,
+    ModelProfile,
     Post,
     PostApproval,
     PostMetric,
     PostStatus,
     PostTarget,
+    SkillDefinition,
+    SkillVersionStatus,
     SocialAccount,
     TargetStatus,
     User,
+    WorkflowMode,
+    WorkflowStage,
     Workspace,
     WorkspaceMember,
     WorkspaceRole,
+    WorkspaceSkillVersion,
     utcnow,
 )
 from fastsocial.security import (
@@ -100,16 +131,18 @@ from fastsocial.services import (
     store_media,
     workspace_for_user,
 )
+from fastsocial.skills_service import publish_skill_version, skill_content
 from fastsocial.storage import LocalStorage, media_storage
 
 
 class PageContext:
-    def __init__(self, user, workspace, membership, accounts, pending_approvals):
+    def __init__(self, user, workspace, membership, accounts, pending_approvals, chat_sessions):
         self.user = user
         self.workspace = workspace
         self.membership = membership
         self.accounts = accounts
         self.pending_approvals = pending_approvals
+        self.chat_sessions = chat_sessions
 
 
 def _context(sess: dict) -> PageContext | None:
@@ -146,7 +179,15 @@ def _context(sess: dict) -> PageContext | None:
             )
             or 0
         )
-        return PageContext(user, workspace, membership, accounts, pending)
+        chat_sessions = list(
+            session.scalars(
+                select(ChatSession)
+                .where(ChatSession.workspace_id == workspace.id)
+                .order_by(desc(ChatSession.updated_at))
+                .limit(12)
+            )
+        )
+        return PageContext(user, workspace, membership, accounts, pending, chat_sessions)
 
 
 def _signin_redirect():
@@ -169,6 +210,7 @@ def _app_page(ctx: PageContext, title: str, path: str, *children, action=None):
         ctx.accounts,
         *children,
         pending_approvals=ctx.pending_approvals,
+        chat_sessions=ctx.chat_sessions,
         action=action,
     )
 
@@ -192,9 +234,18 @@ def _format_datetime(value: datetime | None, timezone_name: str) -> str:
 
 def _landing():
     features = [
-        ("Plan", "Compose once, tailor per network, and see every post in a calm calendar."),
-        ("Publish", "Use direct APIs, Arcade MCP, or Composio MCP with retries and idempotency."),
-        ("Measure", "Keep normalized analytics and raw platform snapshots in your own database."),
+        (
+            "Create with agents",
+            "Turn a brief into network-native copy through editable marketing skills.",
+        ),
+        (
+            "Bring any model",
+            "Use your own xAI or OpenAI key and choose separate text, image, and video models.",
+        ),
+        (
+            "Review or YOLO",
+            "Pause for human review by default, or let the autonomous workflow deliver end to end.",
+        ),
     ]
     return Html(
         head("Social publishing under your control"),
@@ -216,16 +267,16 @@ def _landing():
                 ),
                 Div(
                     Span("PERSONAL-FIRST SOCIAL MANAGEMENT", cls="eyebrow accent"),
-                    H1("Plan your voice. Publish with confidence."),
+                    H1("Your agentic social studio. Your models. Your voice."),
                     P(
-                        "A private, multi-network publishing system for X, LinkedIn, and Bluesky—designed for one person today and a company tomorrow."
+                        "Create, review, publish, and measure across X, LinkedIn, and Bluesky with editable skills and BYOK / BYOM freedom. Personal today, company-ready tomorrow."
                     ),
                     Div(
                         A("Create your workspace", href="/register", cls="btn primary"),
                         A("Sign in", href="/signin", cls="btn"),
                         cls="public-hero-actions",
                     ),
-                    Small("FastHTML · PostgreSQL · Cloudflare R2 · xAI"),
+                    Small("FastHTML · HTMX · PostgreSQL · Cloudflare R2 · xAI + OpenAI"),
                     cls="public-hero",
                 ),
                 Div(
@@ -242,9 +293,9 @@ def _landing():
                 ),
                 Div(
                     Div(
-                        H2("Your content and credentials stay under your control."),
+                        H2("Bring your own key. Bring your own model. Keep control."),
                         P(
-                            "Encrypted social tokens, private R2 media, workspace isolation, approvals when your team grows, and no mandatory connector vendor."
+                            "All model features require sign-in. Workspace API keys are encrypted, shared server models are gated, and publishing remains deterministic and auditable."
                         ),
                     ),
                     A("Build your queue", href="/register", cls="btn primary"),
@@ -531,8 +582,8 @@ def dashboard(sess):
                 "＋",
                 "Your queue is clear",
                 "Create your first post and choose when it should go live.",
-                "Create a post",
-                "/compose",
+                "New Post",
+                "/new-post",
             ),
             cls="card-body",
         ),
@@ -566,7 +617,7 @@ def dashboard(sess):
             "OVERVIEW",
             "Good to see you.",
             "Plan once, publish everywhere, and keep a clean view of what is working.",
-            A("+ Create post", href="/compose", cls="btn primary"),
+            A("+ New Post", href="/new-post", cls="btn primary"),
         ),
         Div(
             stat_card("Connected accounts", len(ctx.accounts), "Across X, LinkedIn, and Bluesky"),
@@ -584,6 +635,11 @@ async def compose(request, sess):
     ctx = _context(sess)
     if not ctx:
         return _signin_redirect()
+    # The former manual composer remains as a bookmark-compatible entry point.
+    # All creation now starts in the agentic New Post workflow.
+    return RedirectResponse("/new-post", status_code=303)
+
+    # Kept temporarily below for schema-compatible rollback during the local upgrade window.
     error = ""
     if request.method == "POST":
         form = await request.form()
@@ -632,7 +688,12 @@ async def compose(request, sess):
         )
     account_options = [
         Label(
-            Input(type="checkbox", name="target_ids", value=str(account.id), checked=True),
+            Input(
+                type="checkbox",
+                name="target_ids",
+                value=str(account.id),
+                checked=True,
+            ),
             Span(
                 PLATFORM_MARKS.get(account.platform, "?"), cls=f"platform-mark {account.platform}"
             ),
@@ -770,14 +831,678 @@ async def ai_compose(request, sess):
     form = await request.form()
     if not verify_csrf(sess, form.get("csrf")):
         return JSONResponse({"error": "invalid_csrf"}, status_code=403)
+    return JSONResponse({"error": "agentic_new_post_required", "url": "/new-post"}, status_code=410)
+
+    # Compatibility implementation retained until the next schema release.
     try:
-        return JSONResponse(
-            await generate_variants(
-                str(form.get("prompt") or ""), str(form.get("tone") or "clear and useful")
+        with session_scope() as session:
+            resolved = resolve_model(
+                session,
+                workspace_id=ctx.workspace.id,
+                user_email=ctx.user.email,
+                provider=ctx.workspace.default_model_provider,
+                purpose="text",
             )
+        result = await invoke_json(
+            resolved,
+            system_prompt=(
+                "Create safe social copy and return only JSON with keys x, linkedin, bluesky. "
+                "Keep X within 280 characters and Bluesky within 300 characters."
+            ),
+            user_prompt=(
+                f"Tone: {str(form.get('tone') or 'clear and useful')}\n"
+                f"Brief: {str(form.get('prompt') or '')}"
+            ),
         )
+        return JSONResponse(result)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+def _model_gate_message(ctx: PageContext, provider: str) -> str:
+    with session_scope() as session:
+        credential = session.scalar(
+            select(AIProviderCredential).where(
+                AIProviderCredential.workspace_id == ctx.workspace.id,
+                AIProviderCredential.provider == provider,
+            )
+        )
+    if credential:
+        return f"Workspace {provider} key {credential.masked_hint}"
+    server_key = settings().xai_api_key if provider == "xai" else settings().openai_api_key
+    if settings().server_model_access_allowed(ctx.user.email) and server_key:
+        return f"FastSocial server {provider} key"
+    return "BYOK required"
+
+
+def _workflow_steps(stage: WorkflowStage):
+    current = {
+        WorkflowStage.create: 0,
+        WorkflowStage.generate: 0,
+        WorkflowStage.review: 1,
+        WorkflowStage.post: 2,
+        WorkflowStage.complete: 3,
+        WorkflowStage.failed: 0,
+    }.get(stage, 0)
+    labels = ("Create / Generate", "Review", "Post")
+    return Div(
+        *[
+            Div(
+                Span("✓" if current > index else str(index + 1), cls="workflow-step-number"),
+                Span(label),
+                cls=f"workflow-step{' done' if current > index else ''}{' active' if current == index else ''}",
+            )
+            for index, label in enumerate(labels)
+        ],
+        cls="workflow-steps",
+    )
+
+
+def _new_post_form(ctx: PageContext, sess: dict, error: str = ""):
+    account_options = [
+        Label(
+            Input(
+                type="checkbox",
+                name="target_ids",
+                value=str(account.id),
+                checked=True,
+                form="new-post-form",
+            ),
+            Span(
+                PLATFORM_MARKS.get(account.platform, "?"), cls=f"platform-mark {account.platform}"
+            ),
+            Span(account.display_name or account.username or PLATFORM_NAMES.get(account.platform)),
+            cls="account-option",
+        )
+        for account in ctx.accounts
+        if account.status == AccountStatus.connected
+    ]
+    return Div(
+        _workflow_steps(WorkflowStage.generate),
+        flash(error, "error"),
+        Div(
+            Form(
+                csrf_input(sess),
+                Div(
+                    Span("CREATIVE BRIEF", cls="eyebrow accent"),
+                    H1("What should we create?"),
+                    P(
+                        "Describe the audience, idea, evidence, desired action, and anything the agents must avoid."
+                    ),
+                    cls="agent-workbench-head",
+                ),
+                Div(
+                    Label("Brief"),
+                    Textarea(
+                        name="brief",
+                        placeholder="Create a concise launch post for founders explaining…",
+                        required=True,
+                        autofocus=True,
+                    ),
+                    cls="field",
+                ),
+                Div(
+                    Label("Workflow"),
+                    Label(
+                        Input(
+                            type="radio",
+                            name="workflow_mode",
+                            value="review",
+                            checked=ctx.workspace.default_workflow_mode == WorkflowMode.review,
+                        ),
+                        Div(
+                            Strong("Review"),
+                            Small("Generate, inspect and confirm before queueing."),
+                        ),
+                        cls="choice-card",
+                    ),
+                    Label(
+                        Input(
+                            type="radio",
+                            name="workflow_mode",
+                            value="yolo",
+                            checked=ctx.workspace.default_workflow_mode == WorkflowMode.yolo,
+                        ),
+                        Div(Strong("YOLO"), Small("Generate, review and deliver autonomously.")),
+                        cls="choice-card warning",
+                    ),
+                    cls="field choice-grid",
+                ),
+                Div(
+                    Label("Generate media"),
+                    Div(
+                        Label(Input(type="checkbox", name="media_kinds", value="image"), " Image"),
+                        Label(Input(type="checkbox", name="media_kinds", value="video"), " Video"),
+                        cls="schedule-tabs",
+                    ),
+                    cls="field",
+                ),
+                Div(
+                    Label("YOLO delivery"),
+                    Select(
+                        Option("Publish now", value="now", selected=True),
+                        Option("Schedule", value="schedule"),
+                        Option("Save as draft", value="draft"),
+                        name="delivery",
+                    ),
+                    Input(type="datetime-local", name="scheduled_at"),
+                    Small("Review mode always pauses before delivery."),
+                    cls="field",
+                ),
+                Button("Create with agents →", type="submit", cls="btn primary"),
+                method="post",
+                action="/new-post",
+                id="new-post-form",
+                cls="agent-brief-form",
+            ),
+            Div(
+                H2("Publish to"),
+                Div(
+                    *(
+                        account_options
+                        or [
+                            P(
+                                "Connect a social account to publish; generation can still create a draft.",
+                                cls="form-help",
+                            )
+                        ]
+                    ),
+                    cls="account-options",
+                ),
+                H2("Model access", style="margin-top:22px"),
+                P(
+                    f"{ctx.workspace.default_model_provider.upper()} · {_model_gate_message(ctx, ctx.workspace.default_model_provider)}",
+                    cls="form-help",
+                ),
+                A("Configure models", href="/integrations#ai-models", cls="btn small"),
+                cls="agent-context-panel",
+            ),
+            cls="agent-workbench new-agent-workbench",
+        ),
+    )
+
+
+@rt("/new-post")
+async def new_post(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if request.method == "GET":
+        return _app_page(
+            ctx,
+            "New Post",
+            "/new-post",
+            _new_post_form(ctx, sess),
+        )
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return _app_page(
+            ctx, "New Post", "/new-post", _new_post_form(ctx, sess, "Your session expired.")
+        )
+    brief = str(form.get("brief") or "").strip()
+    try:
+        if not brief:
+            raise ValueError("Creative brief is required")
+        mode = WorkflowMode(
+            str(form.get("workflow_mode") or ctx.workspace.default_workflow_mode.value)
+        )
+        target_ids = [uuid.UUID(value) for value in form.getlist("target_ids")]
+        target_map = {str(account.id): account.platform for account in ctx.accounts}
+        platforms = list(
+            dict.fromkeys(target_map[str(item)] for item in target_ids if str(item) in target_map)
+        )
+        state = {
+            "provider": ctx.workspace.default_model_provider,
+            "target_ids": [str(item) for item in target_ids],
+            "platforms": platforms,
+            "media_kinds": [str(item) for item in form.getlist("media_kinds")],
+            "delivery": str(form.get("delivery") or "now"),
+            "scheduled_at": str(form.get("scheduled_at") or ""),
+        }
+        if state["delivery"] == "schedule" and not _parse_datetime(
+            state["scheduled_at"], ctx.workspace.timezone
+        ):
+            raise ValueError("Choose a schedule time")
+        with session_scope() as session:
+            resolve_model(
+                session,
+                workspace_id=ctx.workspace.id,
+                user_email=ctx.user.email,
+                provider=ctx.workspace.default_model_provider,
+                purpose="text",
+            )
+            chat = create_chat_session(
+                session,
+                workspace_id=ctx.workspace.id,
+                user_id=ctx.user.id,
+                brief=brief,
+                workflow_mode=mode,
+                state=state,
+            )
+            chat_id = chat.id
+        artifact_id = await generate_chat_artifact(chat_id, user_email=ctx.user.email)
+        if mode == WorkflowMode.yolo:
+            with session_scope() as session:
+                artifact = session.get(ContentArtifact, artifact_id)
+                prompts = dict(artifact.content)
+            for kind in state["media_kinds"]:
+                prompt = str(prompts.get(f"{kind}_prompt") or brief)
+                await generate_media_for_chat(
+                    chat_id,
+                    user_id=ctx.user.id,
+                    user_email=ctx.user.email,
+                    kind=kind,
+                    prompt=prompt,
+                )
+            await _deliver_chat(chat_id, ctx, delivery=state["delivery"])
+        return RedirectResponse(f"/chats/{chat_id}", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return _app_page(ctx, "New Post", "/new-post", _new_post_form(ctx, sess, str(exc)))
+
+
+def _chat_records(ctx: PageContext, chat_id: str):
+    try:
+        parsed = uuid.UUID(chat_id)
+    except ValueError:
+        return None, [], [], None
+    with session_scope() as session:
+        chat = session.scalar(
+            select(ChatSession).where(
+                ChatSession.id == parsed,
+                ChatSession.workspace_id == ctx.workspace.id,
+            )
+        )
+        if not chat:
+            return None, [], [], None
+        messages = list(
+            session.scalars(
+                select(ChatMessage)
+                .where(ChatMessage.chat_session_id == chat.id)
+                .order_by(ChatMessage.created_at)
+            )
+        )
+        events = list(
+            session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.chat_session_id == chat.id)
+                .order_by(AgentEvent.sequence)
+            )
+        )
+        artifact = latest_artifact(session, chat.id)
+        return chat, messages, events, artifact
+
+
+def _chat_page(
+    ctx: PageContext,
+    sess: dict,
+    chat,
+    messages,
+    events,
+    artifact,
+    message: str = "",
+    error: str = "",
+):
+    content = dict(artifact.content) if artifact else {}
+    completed = chat.stage == WorkflowStage.complete
+    variants = content.get("variants") if isinstance(content.get("variants"), dict) else {}
+    state = dict(chat.state or {})
+    media_ids = [uuid.UUID(item) for item in state.get("generated_media_ids", [])]
+    with session_scope() as session:
+        media_items = (
+            list(session.scalars(select(Media).where(Media.id.in_(media_ids)))) if media_ids else []
+        )
+    chat_panel = Div(
+        Div(
+            H2("Creation chat"),
+            Span(chat.workflow_mode.value.upper(), cls=f"mode-badge {chat.workflow_mode.value}"),
+            cls="card-head",
+        ),
+        Div(
+            *[
+                Div(
+                    Div(item.content, cls="chat-bubble"),
+                    Small(
+                        "You"
+                        if item.role == ChatRole.user
+                        else (item.agent_slug or "FastSocial agents")
+                    ),
+                    cls=f"chat-message {item.role.value}",
+                )
+                for item in messages
+            ],
+            cls="agent-chat-messages",
+        ),
+        Details(
+            Summary(f"Agent activity · {len(events)} events"),
+            Ul(
+                *[
+                    Li(Span(event.stage.title(), cls="event-stage"), event.label)
+                    for event in events
+                ],
+                cls="agent-events",
+            ),
+            cls="agent-trace",
+            open=chat.stage in {WorkflowStage.generate, WorkflowStage.failed},
+        ),
+        Form(
+            csrf_input(sess),
+            Textarea(
+                name="message",
+                placeholder="Refine the angle, tone, evidence, or media direction…",
+                required=True,
+            ),
+            Button("Send →", type="submit", cls="btn primary"),
+            method="post",
+            action=f"/chats/{chat.id}/messages",
+            cls="agent-followup",
+        )
+        if chat.stage not in {WorkflowStage.complete}
+        else "",
+        cls="card agent-chat-panel",
+    )
+    if artifact:
+        review = content.get("review") if isinstance(content.get("review"), dict) else {}
+        artifact_panel = Div(
+            Div(
+                Div(H2("Post artifact"), Small(f"{artifact.provider}:{artifact.model_name}")),
+                Span(artifact.status.value.upper(), cls="mode-badge"),
+                cls="card-head",
+            ),
+            Form(
+                csrf_input(sess),
+                Div(
+                    Label("Master post"),
+                    Textarea(
+                        content.get("text", ""),
+                        name="text",
+                        required=True,
+                        readonly=True if completed else None,
+                    ),
+                    cls="field",
+                ),
+                *[
+                    Div(
+                        Label(f"{PLATFORM_NAMES.get(platform, platform.title())} variant"),
+                        Textarea(
+                            value,
+                            name=f"variant_{platform}",
+                            readonly=True if completed else None,
+                        ),
+                        cls="field compact",
+                    )
+                    for platform, value in variants.items()
+                ],
+                Div(
+                    H3("Editorial review"),
+                    P(str(review.get("summary") or "Ready for review.")),
+                    Ul(*[Li(str(item)) for item in review.get("risks", [])])
+                    if review.get("risks")
+                    else "",
+                    cls="review-box",
+                ),
+                (
+                    Div(
+                        Label("Schedule time"),
+                        Input(
+                            type="datetime-local",
+                            name="scheduled_at",
+                            value=str(state.get("scheduled_at") or ""),
+                        ),
+                        cls="field",
+                    )
+                    if not completed
+                    else ""
+                ),
+                (
+                    Div(
+                        Button(
+                            "Save draft", type="submit", name="delivery", value="draft", cls="btn"
+                        ),
+                        Button(
+                            "Schedule",
+                            type="submit",
+                            name="delivery",
+                            value="schedule",
+                            cls="btn",
+                            disabled=True if not state.get("target_ids") else None,
+                        ),
+                        Button(
+                            "Publish now",
+                            type="submit",
+                            name="delivery",
+                            value="now",
+                            cls="btn primary",
+                            disabled=True if not state.get("target_ids") else None,
+                        ),
+                        cls="form-actions",
+                    )
+                    if not completed
+                    else Div(
+                        A("View post →", href=f"/posts/{chat.post_id}", cls="btn primary"),
+                        cls="form-actions",
+                    )
+                ),
+                method="post",
+                action=f"/chats/{chat.id}/post",
+            ),
+            Div(
+                Form(
+                    csrf_input(sess),
+                    Input(type="hidden", name="kind", value="image"),
+                    Input(type="hidden", name="prompt", value=content.get("image_prompt", "")),
+                    Button("Generate image", type="submit", cls="btn"),
+                    method="post",
+                    action=f"/chats/{chat.id}/media",
+                ),
+                Form(
+                    csrf_input(sess),
+                    Input(type="hidden", name="kind", value="video"),
+                    Input(type="hidden", name="prompt", value=content.get("video_prompt", "")),
+                    Button("Generate video", type="submit", cls="btn"),
+                    method="post",
+                    action=f"/chats/{chat.id}/media",
+                ),
+                cls="form-actions left media-actions",
+            )
+            if not completed
+            else "",
+            Div(
+                *[
+                    Div(
+                        (
+                            NotStr(
+                                f'<img src="{media_storage().url(item.storage_key)}" alt="Generated media">'
+                            )
+                            if item.mime_type.startswith("image/")
+                            else NotStr(
+                                f'<video controls preload="metadata" src="{media_storage().url(item.storage_key)}"></video>'
+                            )
+                        ),
+                        Small(item.filename),
+                        cls="generated-media-item",
+                    )
+                    for item in media_items
+                ],
+                cls="generated-media-strip",
+            )
+            if media_items
+            else "",
+            cls="card agent-artifact-panel",
+        )
+    else:
+        artifact_panel = empty_state(
+            "✦", "No artifact yet", "Send a refinement or start a new post."
+        )
+    return Div(
+        _workflow_steps(chat.stage),
+        flash(message),
+        flash(error, "error"),
+        Div(chat_panel, artifact_panel, cls="agent-workbench"),
+    )
+
+
+@rt("/chats/{chat_id}")
+def chat_detail(chat_id: str, sess, saved: str = "", error: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    chat, messages, events, artifact = _chat_records(ctx, chat_id)
+    if not chat:
+        return Response("Not found", status_code=404)
+    saved_message = {
+        "posted": "Post delivered to the publishing pipeline.",
+        "media": "Generated media saved to the library.",
+    }.get(saved, "")
+    return _app_page(
+        ctx,
+        chat.title,
+        f"/chats/{chat.id}",
+        _chat_page(ctx, sess, chat, messages, events, artifact, saved_message, error),
+    )
+
+
+@rt("/chats/{chat_id}/messages", methods=["POST"])
+async def chat_message(chat_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    chat, _messages, _events, _artifact = _chat_records(ctx, chat_id)
+    if not chat:
+        return Response("Not found", status_code=404)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    value = str(form.get("message") or "").strip()
+    if not value:
+        return RedirectResponse(f"/chats/{chat.id}?error=Message+is+required", status_code=303)
+    with session_scope() as session:
+        row = session.get(ChatSession, chat.id)
+        session.add(ChatMessage(chat_session_id=row.id, role=ChatRole.user, content=value))
+        row.status = "active"
+        row.stage = WorkflowStage.create
+    try:
+        await generate_chat_artifact(chat.id, user_email=ctx.user.email)
+        return RedirectResponse(f"/chats/{chat.id}", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/chats/{chat.id}?error={quote_plus(str(exc))}", status_code=303)
+
+
+@rt("/chats/{chat_id}/media", methods=["POST"])
+async def chat_media(chat_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    chat, _messages, _events, _artifact = _chat_records(ctx, chat_id)
+    if not chat:
+        return Response("Not found", status_code=404)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        prompt = str(form.get("prompt") or "").strip()
+        if not prompt:
+            raise ValueError("Generation prompt is required")
+        await generate_media_for_chat(
+            chat.id,
+            user_id=ctx.user.id,
+            user_email=ctx.user.email,
+            kind=str(form.get("kind") or ""),
+            prompt=prompt,
+        )
+        return RedirectResponse(f"/chats/{chat.id}?saved=media", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/chats/{chat.id}?error={quote_plus(str(exc))}", status_code=303)
+
+
+async def _deliver_chat(chat_id: uuid.UUID, ctx: PageContext, *, delivery: str, form=None):
+    with session_scope() as session:
+        chat = session.get(ChatSession, chat_id)
+        artifact = latest_artifact(session, chat_id)
+        if not chat or not artifact or chat.workspace_id != ctx.workspace.id:
+            raise ValueError("Post artifact not found")
+        if chat.post_id:
+            return chat.post_id
+        content = dict(artifact.content)
+        if form is not None:
+            content["text"] = str(form.get("text") or "").strip()
+            variants = dict(content.get("variants") or {})
+            for platform in list(variants):
+                variants[platform] = str(
+                    form.get(f"variant_{platform}") or variants[platform]
+                ).strip()
+            content["variants"] = variants
+            artifact.content = content
+        state = dict(chat.state or {})
+        scheduled_value = (
+            str(form.get("scheduled_at") or "")
+            if form is not None
+            else str(state.get("scheduled_at") or "")
+        )
+        scheduled_at = (
+            utcnow()
+            if delivery == "now"
+            else _parse_datetime(scheduled_value, ctx.workspace.timezone)
+            if delivery == "schedule"
+            else None
+        )
+        if delivery == "schedule" and not scheduled_at:
+            raise ValueError("Choose a schedule time")
+        target_ids = [uuid.UUID(item) for item in state.get("target_ids", [])]
+        media_ids = [uuid.UUID(item) for item in state.get("generated_media_ids", [])]
+        workspace = session.get(Workspace, chat.workspace_id)
+        post = create_post(
+            session,
+            workspace=workspace,
+            user_id=ctx.user.id,
+            text=content.get("text", ""),
+            target_ids=target_ids,
+            media_ids=media_ids,
+            scheduled_at=scheduled_at,
+            save_draft=delivery == "draft" or not target_ids,
+            platform_text=content.get("variants") or {},
+        )
+        chat.post_id = post.id
+        chat.stage = WorkflowStage.post
+        chat.status = "completed"
+        artifact.status = (
+            ArtifactStatus.posted if delivery == "now" and target_ids else ArtifactStatus.ready
+        )
+        record_event(
+            session,
+            chat.id,
+            "post",
+            "completed",
+            "Post handed to the deterministic publishing pipeline",
+            delivery=delivery,
+        )
+        post_id = post.id
+        should_publish = (
+            delivery == "now" and bool(target_ids) and post.status == PostStatus.scheduled
+        )
+    if should_publish:
+        await publish_post(post_id)
+    with session_scope() as session:
+        chat = session.get(ChatSession, chat_id)
+        chat.stage = WorkflowStage.complete
+    return post_id
+
+
+@rt("/chats/{chat_id}/post", methods=["POST"])
+async def chat_post(chat_id: str, request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    chat, _messages, _events, _artifact = _chat_records(ctx, chat_id)
+    if not chat:
+        return Response("Not found", status_code=404)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    try:
+        await _deliver_chat(chat.id, ctx, delivery=str(form.get("delivery") or "draft"), form=form)
+        return RedirectResponse(f"/chats/{chat.id}?saved=posted", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(f"/chats/{chat.id}?error={quote_plus(str(exc))}", status_code=303)
 
 
 def _post_query(workspace_id):
@@ -839,8 +1564,8 @@ def posts_page(sess, status: str = ""):
             "≡",
             "No posts yet",
             "Draft, schedule, or publish your first piece of content.",
-            "Create a post",
-            "/compose",
+            "New Post",
+            "/new-post",
         )
     )
     return _app_page(
@@ -853,7 +1578,7 @@ def posts_page(sess, status: str = ""):
             "Filter drafts, scheduled work, published posts, and failures from the same workspace.",
         ),
         content,
-        action=A("+ Create post", href="/compose", cls="btn primary"),
+        action=A("+ New Post", href="/new-post", cls="btn primary"),
     )
 
 
@@ -1203,6 +1928,153 @@ def calendar_page(sess, year: int = 0, month: int = 0):
     )
 
 
+@rt("/skills")
+def skills_page(sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    with session_scope() as session:
+        skills = list(session.scalars(select(SkillDefinition).order_by(SkillDefinition.name)))
+        edited = {
+            slug
+            for (slug,) in session.execute(
+                select(WorkspaceSkillVersion.skill_slug).where(
+                    WorkspaceSkillVersion.workspace_id == ctx.workspace.id,
+                    WorkspaceSkillVersion.status == SkillVersionStatus.published,
+                )
+            )
+        }
+    cards = [
+        A(
+            Div(
+                Span("✦", cls="skill-icon"),
+                Div(H2(skill.name), P(skill.description or "Agent operating instructions.")),
+                Span(
+                    "CUSTOM" if skill.slug in edited else f"v{skill.upstream_version or '1'}",
+                    cls="mode-badge",
+                ),
+                cls="skill-card-content",
+            ),
+            href=f"/skills/{skill.slug}",
+            cls="skill-card",
+        )
+        for skill in skills
+    ]
+    return _app_page(
+        ctx,
+        "Skills",
+        "/skills",
+        page_intro(
+            "AGENT OPERATING SYSTEM",
+            f"{len(skills)} editable marketing skills.",
+            "FastSocial routes each brief through the relevant skills before the deterministic publishing pipeline.",
+        ),
+        Div(*cards, cls="skills-grid"),
+    )
+
+
+@rt("/skills/{slug}")
+async def skill_editor(slug: str, request, sess, saved: str = ""):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    can_edit = ctx.membership.role in {WorkspaceRole.owner, WorkspaceRole.admin}
+    error = ""
+    with session_scope() as session:
+        definition = session.get(SkillDefinition, slug)
+    if not definition:
+        return Response("Not found", status_code=404)
+    if request.method == "POST":
+        form = await request.form()
+        if not can_edit:
+            return Response("Forbidden", status_code=403)
+        if not verify_csrf(sess, form.get("csrf")):
+            error = "Your session expired."
+        else:
+            content = str(form.get("content") or "").strip()
+            if not content:
+                error = "Skill content cannot be empty."
+            else:
+                with session_scope() as session:
+                    publish_skill_version(
+                        session,
+                        workspace_id=ctx.workspace.id,
+                        slug=slug,
+                        content=content,
+                        changed_by=ctx.user.id,
+                    )
+                    audit(session, ctx.workspace.id, ctx.user.id, "skill.published", definition)
+                return RedirectResponse(f"/skills/{slug}?saved=1", status_code=303)
+    with session_scope() as session:
+        content = skill_content(session, ctx.workspace.id, slug)
+        versions = list(
+            session.scalars(
+                select(WorkspaceSkillVersion)
+                .where(
+                    WorkspaceSkillVersion.workspace_id == ctx.workspace.id,
+                    WorkspaceSkillVersion.skill_slug == slug,
+                )
+                .order_by(desc(WorkspaceSkillVersion.version))
+            )
+        )
+    editor = Form(
+        csrf_input(sess),
+        Div(
+            Button("Editor", type="button", cls="skill-tab active", data_tab="editor"),
+            Button("Markdown", type="button", cls="skill-tab", data_tab="markdown"),
+            cls="skill-tabs",
+        ),
+        Textarea(content, name="content", id="skill-markdown", cls="skill-markdown", rows="30"),
+        Div(id="skill-editor", cls="skill-editor"),
+        Div(
+            A("Cancel", href="/skills", cls="btn"),
+            Button("Publish new version", type="submit", cls="btn primary", disabled=not can_edit),
+            cls="form-actions",
+        ),
+        method="post",
+        action=f"/skills/{slug}",
+        id="skill-form",
+        cls="card skill-edit-card",
+    )
+    history = Div(
+        Div(
+            H2("Version history"),
+            Span(f"{len(versions)} custom", cls="mode-badge"),
+            cls="card-head",
+        ),
+        *[
+            Div(
+                Strong(f"Version {row.version}"),
+                Small(_format_datetime(row.created_at, ctx.workspace.timezone)),
+                P(row.content[:180].replace("\n", " ") + ("…" if len(row.content) > 180 else "")),
+                cls="skill-version",
+            )
+            for row in versions
+        ],
+        P("The upstream baseline is active until you publish a custom version.", cls="form-help")
+        if not versions
+        else "",
+        cls="card skill-history",
+    )
+    return _app_page(
+        ctx,
+        definition.name,
+        f"/skills/{slug}",
+        Link(rel="stylesheet", href="https://cdn.quilljs.com/2.0.3/quill.snow.css"),
+        Script(src="https://cdn.quilljs.com/2.0.3/quill.js"),
+        Script(src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"),
+        page_intro(
+            "EDITABLE SKILL",
+            definition.name,
+            definition.description[:360] + ("…" if len(definition.description) > 360 else ""),
+        ),
+        flash("Skill version published." if saved else ""),
+        flash(error, "error"),
+        Div(editor, history, cls="skill-editor-layout"),
+        Script(src="/static/skills.js"),
+    )
+
+
 def _integration_card(platform: str, accounts: list[SocialAccount]):
     direct_ready = {
         "x": bool(settings().x_client_id and settings().x_client_secret),
@@ -1303,6 +2175,94 @@ def _integration_card(platform: str, accounts: list[SocialAccount]):
     )
 
 
+def _ai_provider_card(
+    ctx: PageContext,
+    sess: dict,
+    provider: str,
+    credential: AIProviderCredential | None,
+    profiles: dict[tuple[str, str], ModelProfile],
+):
+    configured = bool(credential)
+    server_available = settings().server_model_access_allowed(ctx.user.email) and bool(
+        settings().xai_api_key if provider == "xai" else settings().openai_api_key
+    )
+    access = (
+        f"Workspace key {credential.masked_hint}"
+        if credential
+        else "FastSocial server key"
+        if server_available
+        else "Bring your own key"
+    )
+    return Div(
+        Div(
+            Div(H2("xAI" if provider == "xai" else "OpenAI"), Small(access)),
+            Span(
+                "CONNECTED" if configured or server_available else "BYOK REQUIRED",
+                cls="status-badge connected"
+                if configured or server_available
+                else "status-badge draft",
+            ),
+            cls="integration-card-head",
+        ),
+        P(
+            "Your workspace key is encrypted at rest and takes precedence over the private server key. "
+            "Model IDs are fully configurable for bring-your-own-model workflows."
+        ),
+        Form(
+            csrf_input(sess),
+            Input(type="hidden", name="provider", value=provider),
+            Div(
+                Label("API key"),
+                Input(
+                    type="password",
+                    name="api_key",
+                    placeholder="Leave blank to keep the existing key",
+                    autocomplete="off",
+                ),
+                cls="field",
+            ),
+            *[
+                Div(
+                    Label(f"{purpose.title()} model"),
+                    Input(
+                        type="text",
+                        name=f"{purpose}_model",
+                        value=(
+                            profiles[(provider, purpose)].model_name
+                            if (provider, purpose) in profiles
+                            else default_model(provider, purpose)
+                        ),
+                        required=True,
+                    ),
+                    cls="field",
+                )
+                for purpose in ("text", "image", "video")
+            ],
+            Div(
+                Button(
+                    "Save provider", type="submit", name="action", value="save", cls="btn primary"
+                ),
+                Button("Test access", type="submit", name="action", value="test", cls="btn"),
+                Button(
+                    "Remove BYOK", type="submit", name="action", value="remove", cls="btn danger"
+                )
+                if credential
+                else "",
+                cls="form-actions left",
+            ),
+            method="post",
+            action="/integrations/models",
+            cls="ai-provider-form",
+        ),
+        (
+            P(f"Last test: {credential.status}. {credential.last_error}", cls="form-help")
+            if credential and credential.last_tested_at
+            else ""
+        ),
+        cls="integration-card ai-provider-card",
+    )
+
+
 @rt("/integrations")
 def integrations_page(sess, saved: str = "", error: str = ""):
     ctx = _context(sess)
@@ -1313,6 +2273,21 @@ def integrations_page(sess, saved: str = "", error: str = ""):
         for platform in PLATFORM_NAMES
     }
     healthy = sum(account.status == AccountStatus.connected for account in ctx.accounts)
+    with session_scope() as session:
+        credentials = {
+            item.provider: item
+            for item in session.scalars(
+                select(AIProviderCredential).where(
+                    AIProviderCredential.workspace_id == ctx.workspace.id
+                )
+            )
+        }
+        profiles = {
+            (item.provider, item.purpose): item
+            for item in session.scalars(
+                select(ModelProfile).where(ModelProfile.workspace_id == ctx.workspace.id)
+            )
+        }
     return _app_page(
         ctx,
         "Integrations",
@@ -1343,10 +2318,140 @@ def integrations_page(sess, saved: str = "", error: str = ""):
             cls="integration-summary",
         ),
         Div(
+            Div(
+                Span("AI MODELS", cls="eyebrow accent"),
+                H2("BYOK / BYOM"),
+                P("Choose xAI or OpenAI independently for text, image, and video generation."),
+                cls="section-heading",
+                id="ai-models",
+            ),
+            Div(
+                *[
+                    _ai_provider_card(ctx, sess, provider, credentials.get(provider), profiles)
+                    for provider in ("xai", "openai")
+                ],
+                cls="ai-provider-grid",
+            ),
+        ),
+        Div(
             *[_integration_card(platform, grouped[platform]) for platform in PLATFORM_NAMES],
             style="display:grid;gap:16px",
         ),
     )
+
+
+@rt("/integrations/models", methods=["POST"])
+async def integrations_models(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    if ctx.membership.role not in {WorkspaceRole.owner, WorkspaceRole.admin}:
+        return Response("Forbidden", status_code=403)
+    form = await request.form()
+    if not verify_csrf(sess, form.get("csrf")):
+        return Response("Forbidden", status_code=403)
+    provider = str(form.get("provider") or "").lower()
+    action = str(form.get("action") or "save")
+    if provider not in {"xai", "openai"}:
+        return Response("Bad request", status_code=400)
+    try:
+        with session_scope() as session:
+            credential = session.scalar(
+                select(AIProviderCredential).where(
+                    AIProviderCredential.workspace_id == ctx.workspace.id,
+                    AIProviderCredential.provider == provider,
+                )
+            )
+            if action == "remove":
+                if credential:
+                    session.delete(credential)
+                audit(
+                    session,
+                    ctx.workspace.id,
+                    ctx.user.id,
+                    "model_key.removed",
+                    ctx.workspace,
+                    {"provider": provider},
+                )
+                return RedirectResponse(
+                    "/integrations?saved=model_removed#ai-models", status_code=303
+                )
+            api_key = str(form.get("api_key") or "").strip()
+            if api_key:
+                if credential is None:
+                    credential = AIProviderCredential(
+                        workspace_id=ctx.workspace.id,
+                        provider=provider,
+                        api_key_encrypted=encrypt_text(api_key),
+                        masked_hint=f"••••{api_key[-4:]}",
+                        created_by=ctx.user.id,
+                    )
+                    session.add(credential)
+                else:
+                    credential.api_key_encrypted = encrypt_text(api_key)
+                    credential.masked_hint = f"••••{api_key[-4:]}"
+                    credential.status = "connected"
+                    credential.last_error = ""
+            for purpose in ("text", "image", "video"):
+                model_name = str(form.get(f"{purpose}_model") or "").strip()
+                if not model_name:
+                    raise ValueError(f"{purpose.title()} model is required")
+                profile = session.scalar(
+                    select(ModelProfile).where(
+                        ModelProfile.workspace_id == ctx.workspace.id,
+                        ModelProfile.provider == provider,
+                        ModelProfile.purpose == purpose,
+                    )
+                )
+                if profile:
+                    profile.model_name = model_name
+                else:
+                    session.add(
+                        ModelProfile(
+                            workspace_id=ctx.workspace.id,
+                            provider=provider,
+                            purpose=purpose,
+                            model_name=model_name,
+                        )
+                    )
+            audit(
+                session,
+                ctx.workspace.id,
+                ctx.user.id,
+                "model_provider.saved",
+                ctx.workspace,
+                {"provider": provider},
+            )
+        if action == "test":
+            with session_scope() as session:
+                resolved = resolve_model(
+                    session,
+                    workspace_id=ctx.workspace.id,
+                    user_email=ctx.user.email,
+                    provider=provider,
+                    purpose="text",
+                )
+            models = await test_model_connection(resolved)
+            with session_scope() as session:
+                credential = session.scalar(
+                    select(AIProviderCredential).where(
+                        AIProviderCredential.workspace_id == ctx.workspace.id,
+                        AIProviderCredential.provider == provider,
+                    )
+                )
+                if credential:
+                    credential.status = "connected"
+                    credential.last_tested_at = utcnow()
+                    credential.last_error = ""
+            return RedirectResponse(
+                f"/integrations?saved={quote_plus(f'{provider} access verified; {len(models)} models visible')}#ai-models",
+                status_code=303,
+            )
+        return RedirectResponse("/integrations?saved=model#ai-models", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(
+            f"/integrations?error={quote_plus(str(exc))}#ai-models", status_code=303
+        )
 
 
 @rt("/integrations/health", methods=["POST"])
@@ -2310,6 +3415,13 @@ async def settings_page(request, sess):
                     workspace.timezone = timezone_name
                     if ctx.membership.role in {WorkspaceRole.owner, WorkspaceRole.admin}:
                         workspace.approval_required = form.get("approval_required") == "on"
+                        workspace.default_workflow_mode = WorkflowMode(
+                            str(form.get("default_workflow_mode") or "review")
+                        )
+                        provider = str(form.get("default_model_provider") or "xai").lower()
+                        if provider not in {"xai", "openai"}:
+                            raise ValueError("Unsupported model provider")
+                        workspace.default_model_provider = provider
                     audit(session, workspace.id, user.id, "settings.updated", workspace)
                 message = "Settings saved."
                 ctx = _context(sess)
@@ -2335,6 +3447,38 @@ async def settings_page(request, sess):
             ),
             " Require approval before team posts are scheduled",
             cls="account-option",
+        ),
+        Div(
+            Label("Default creation workflow"),
+            Select(
+                Option(
+                    "Review — human confirmation",
+                    value="review",
+                    selected=ctx.workspace.default_workflow_mode == WorkflowMode.review,
+                ),
+                Option(
+                    "YOLO — autonomous delivery",
+                    value="yolo",
+                    selected=ctx.workspace.default_workflow_mode == WorkflowMode.yolo,
+                ),
+                name="default_workflow_mode",
+            ),
+            Small("Every New Post can still override this default."),
+            cls="field",
+        ),
+        Div(
+            Label("Default model provider"),
+            Select(
+                Option("xAI", value="xai", selected=ctx.workspace.default_model_provider == "xai"),
+                Option(
+                    "OpenAI",
+                    value="openai",
+                    selected=ctx.workspace.default_model_provider == "openai",
+                ),
+                name="default_model_provider",
+            ),
+            Small("Configure keys and per-purpose model IDs in Integrations."),
+            cls="field",
         ),
         Button("Save settings", type="submit", cls="btn primary"),
         method="post",

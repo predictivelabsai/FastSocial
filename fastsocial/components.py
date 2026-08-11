@@ -38,6 +38,8 @@ ICONS = {
     "integrations": "⇄",
     "team": "♙",
     "settings": "⚙",
+    "skills": "✎",
+    "chat": "✦",
 }
 
 PLATFORM_NAMES = {"x": "X", "linkedin": "LinkedIn", "bluesky": "Bluesky"}
@@ -95,10 +97,16 @@ def auth_page(title: str, subtitle: str, *children):
     )
 
 
-def sidebar(current_path: str, user, workspace, accounts: list, pending_approvals: int = 0):
+def sidebar(
+    current_path: str,
+    user,
+    workspace,
+    accounts: list,
+    pending_approvals: int = 0,
+    chat_sessions: list | None = None,
+):
     items = [
         ("Dashboard", "/", "dashboard"),
-        ("Create post", "/compose", "compose"),
         ("Calendar", "/calendar", "calendar"),
         ("Posts", "/posts", "posts"),
         ("Media", "/media", "media"),
@@ -138,6 +146,12 @@ def sidebar(current_path: str, user, workspace, accounts: list, pending_approval
     )
     lower = [
         A(
+            Span(ICONS["skills"], cls="nav-icon"),
+            Span("Skills"),
+            href="/skills",
+            cls=f"nav-link{' active' if current_path.startswith('/skills') else ''}",
+        ),
+        A(
             Span(ICONS["approvals"], cls="nav-icon"),
             Span("Approvals"),
             (Span(str(pending_approvals), cls="nav-count alert") if pending_approvals else ""),
@@ -174,6 +188,27 @@ def sidebar(current_path: str, user, workspace, accounts: list, pending_approval
             cls="workspace-block",
         ),
         Nav(
+            A(
+                Span("+", cls="nav-icon"),
+                Span("New Post"),
+                href="/new-post",
+                cls=f"new-post-link{' active' if current_path == '/new-post' else ''}",
+            ),
+            Span("CHAT HISTORY", cls="nav-section-label"),
+            Div(
+                *[
+                    A(
+                        Span("●", cls="chat-session-dot"),
+                        Span(item.title, cls="chat-session-title"),
+                        href=f"/chats/{item.id}",
+                        title=item.title,
+                        cls=f"chat-session-link{' active' if current_path == f'/chats/{item.id}' else ''}",
+                    )
+                    for item in (chat_sessions or [])
+                ],
+                P("No post chats yet.", cls="chat-history-empty") if not chat_sessions else "",
+                cls="chat-history-list",
+            ),
             Span("PUBLISH", cls="nav-section-label"),
             *main_links,
             Span("CONNECT", cls="nav-section-label"),
@@ -200,6 +235,7 @@ def app_page(
     accounts: list,
     *children,
     pending_approvals: int = 0,
+    chat_sessions: list | None = None,
     action=None,
 ):
     return Html(
@@ -207,7 +243,14 @@ def app_page(
         Body(
             Input(type="checkbox", id="nav-toggle", cls="nav-toggle"),
             Label("", fr="nav-toggle", cls="mobile-overlay"),
-            sidebar(current_path, user, workspace, accounts, pending_approvals),
+            sidebar(
+                current_path,
+                user,
+                workspace,
+                accounts,
+                pending_approvals,
+                chat_sessions,
+            ),
             Main(
                 Div(
                     Div(

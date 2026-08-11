@@ -12,6 +12,7 @@ from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
+from fastsocial.config import settings
 from fastsocial.db import session_scope
 from fastsocial.models import (
     AccountMetricDaily,
@@ -66,6 +67,9 @@ def create_personal_workspace(session, user: User) -> Workspace:
         slug=slug,
         owner_id=user.id,
         approval_required=False,
+        default_model_provider=(
+            settings().model_provider if settings().model_provider in {"xai", "openai"} else "xai"
+        ),
     )
     session.add(workspace)
     session.flush()

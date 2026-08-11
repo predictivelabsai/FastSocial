@@ -16,11 +16,14 @@ Bluesky through direct platform APIs or configurable Arcade/Composio MCP gateway
 - Idempotent publishing worker with per-target retry state
 - Post/account metrics, server-rendered SVG analytics, and CSV export
 - Personal publishing without approval; optional team approval workflow
-- xAI composition variants
+- Agentic Create / Generate → Review → Post chats with an optional autonomous YOLO mode
+- 49 editable, versioned marketing skills vendored from Corey's Marketing Skills
+- Encrypted xAI/OpenAI BYOK, configurable BYOM profiles, and gated server-key access
+- Text, image, and video generation with model and media provenance
 - PostgreSQL migrations, Docker, local tests, and Coolify CI/CD scaffolding
 
-The UI is generated in Python with FastHTML. There is no application-specific JavaScript;
-HTMX is the progressive-enhancement layer supplied by FastHTML.
+The application and all business workflows are Python. The UI is rendered with FastHTML and HTMX;
+the Skills WYSIWYG uses a small isolated Quill adapter and has a Markdown fallback.
 
 ## Local setup
 
@@ -70,6 +73,11 @@ Current reference documentation:
 Start from `.env.coolify.sample`. Production requires a unique `APP_SECRET`, a Fernet
 `TOKEN_ENCRYPTION_KEY`, PostgreSQL `DATABASE_URL`, dedicated R2 bucket credentials, and whichever
 login/publishing providers are enabled.
+
+`MODEL_PROVIDER` and `MODEL_NAME` select the server default. Server model keys are available only
+to emails in `MODEL_SERVER_ALLOWED_EMAILS` (default: `kaljuvee@gmail.com`); every other signed-in
+user must save an encrypted workspace key in Integrations. Text, image, and video model IDs can be
+overridden independently for xAI and OpenAI.
 
 The canonical domain is `https://fastsocial.org`, port `5062`, health route `/healthz`, and Google
 callback `https://fastsocial.org/auth/google/callback`.

@@ -75,6 +75,39 @@ class ApprovalStatus(str, enum.Enum):
     rejected = "rejected"
 
 
+class WorkflowMode(str, enum.Enum):
+    review = "review"
+    yolo = "yolo"
+
+
+class WorkflowStage(str, enum.Enum):
+    create = "create"
+    generate = "generate"
+    review = "review"
+    post = "post"
+    complete = "complete"
+    failed = "failed"
+
+
+class ChatRole(str, enum.Enum):
+    user = "user"
+    assistant = "assistant"
+    system = "system"
+
+
+class ArtifactStatus(str, enum.Enum):
+    draft = "draft"
+    review = "review"
+    ready = "ready"
+    posted = "posted"
+
+
+class SkillVersionStatus(str, enum.Enum):
+    draft = "draft"
+    published = "published"
+    archived = "archived"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -107,6 +140,10 @@ class Workspace(Base):
     )
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Tallinn")
     approval_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    default_workflow_mode: Mapped[WorkflowMode] = mapped_column(
+        Enum(WorkflowMode), default=WorkflowMode.review
+    )
+    default_model_provider: Mapped[str] = mapped_column(String(40), default="xai")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -355,3 +392,192 @@ class AuditLog(Base):
     entity_id: Mapped[str] = mapped_column(String(255), default="")
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AIProviderCredential(Base):
+    __tablename__ = "ai_provider_credentials"
+    __table_args__ = (UniqueConstraint("workspace_id", "provider"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    api_key_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    masked_hint: Mapped[str] = mapped_column(String(40), default="")
+    status: Mapped[str] = mapped_column(String(40), default="connected")
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ModelProfile(Base):
+    __tablename__ = "model_profiles"
+    __table_args__ = (UniqueConstraint("workspace_id", "provider", "purpose"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    purpose: Mapped[str] = mapped_column(String(40), index=True)
+    model_name: Mapped[str] = mapped_column(String(160))
+    options: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    __table_args__ = (Index("ix_chat_sessions_workspace_updated", "workspace_id", "updated_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    title: Mapped[str] = mapped_column(String(240), default="New post")
+    workflow_mode: Mapped[WorkflowMode] = mapped_column(
+        Enum(WorkflowMode), default=WorkflowMode.review
+    )
+    stage: Mapped[WorkflowStage] = mapped_column(
+        Enum(WorkflowStage), default=WorkflowStage.create, index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    selected_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
+    state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    post_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("posts.id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = (Index("ix_chat_messages_session_created", "chat_session_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    chat_session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[ChatRole] = mapped_column(Enum(ChatRole))
+    content: Mapped[str] = mapped_column(Text)
+    agent_slug: Mapped[str] = mapped_column(String(100), default="")
+    message_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentEvent(Base):
+    __tablename__ = "agent_events"
+    __table_args__ = (Index("ix_agent_events_session_sequence", "chat_session_id", "sequence"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    chat_session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    stage: Mapped[str] = mapped_column(String(40))
+    event_type: Mapped[str] = mapped_column(String(80))
+    label: Mapped[str] = mapped_column(String(240))
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContentArtifact(Base):
+    __tablename__ = "content_artifacts"
+    __table_args__ = (
+        Index("ix_content_artifacts_session_created", "chat_session_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    chat_session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(60), default="social_post")
+    status: Mapped[ArtifactStatus] = mapped_column(
+        Enum(ArtifactStatus), default=ArtifactStatus.draft
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model_name: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class SkillDefinition(Base):
+    __tablename__ = "skill_definitions"
+
+    slug: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    baseline_content: Mapped[str] = mapped_column(Text)
+    upstream_version: Mapped[str] = mapped_column(String(40), default="")
+    upstream_commit: Mapped[str] = mapped_column(String(64), default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    enabled_default: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class WorkspaceSkillVersion(Base):
+    __tablename__ = "workspace_skill_versions"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "skill_slug", "version"),
+        Index("ix_workspace_skill_published", "workspace_id", "skill_slug", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    skill_slug: Mapped[str] = mapped_column(
+        ForeignKey("skill_definitions.slug", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[SkillVersionStatus] = mapped_column(
+        Enum(SkillVersionStatus), default=SkillVersionStatus.published
+    )
+    changed_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MediaGeneration(Base):
+    __tablename__ = "media_generations"
+    __table_args__ = (
+        Index("ix_media_generations_session_created", "chat_session_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    chat_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    media_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("media.id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    provider: Mapped[str] = mapped_column(String(40))
+    model_name: Mapped[str] = mapped_column(String(160))
+    prompt: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    provider_request_id: Mapped[str] = mapped_column(String(255), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
