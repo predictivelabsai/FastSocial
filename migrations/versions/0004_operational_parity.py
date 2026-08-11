@@ -27,55 +27,78 @@ NEW_TABLES = (
 
 
 def upgrade() -> None:
-    op.add_column(
-        "inbox_conversations",
-        sa.Column("priority", sa.String(length=20), nullable=False, server_default="normal"),
-    )
-    op.add_column(
-        "inbox_conversations",
-        sa.Column("assigned_to", sa.Uuid(), nullable=True),
-    )
-    op.create_index(
-        "ix_inbox_conversations_priority", "inbox_conversations", ["priority"], unique=False
-    )
-    op.create_index(
-        "ix_inbox_conversations_assigned_to",
-        "inbox_conversations",
-        ["assigned_to"],
-        unique=False,
-    )
-    op.create_foreign_key(
-        "fk_inbox_conversations_assigned_to_users",
-        "inbox_conversations",
-        "users",
-        ["assigned_to"],
-        ["id"],
-        ondelete="SET NULL",
-    )
-    op.add_column(
-        "inbox_messages",
-        sa.Column(
-            "delivery_status", sa.String(length=40), nullable=False, server_default="received"
-        ),
-    )
-    op.add_column(
-        "inbox_messages", sa.Column("error_message", sa.Text(), nullable=False, server_default="")
-    )
-    op.create_index(
-        "ix_inbox_messages_delivery_status",
-        "inbox_messages",
-        ["delivery_status"],
-        unique=False,
-    )
-    op.add_column(
-        "report_schedules",
-        sa.Column("report_days", sa.Integer(), nullable=False, server_default="30"),
-    )
-    op.add_column(
-        "report_schedules",
-        sa.Column("output_format", sa.String(length=20), nullable=False, server_default="html"),
-    )
     bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
+    conversation_columns = {item["name"] for item in inspector.get_columns("inbox_conversations")}
+    conversation_indexes = {item["name"] for item in inspector.get_indexes("inbox_conversations")}
+    if "priority" not in conversation_columns:
+        op.add_column(
+            "inbox_conversations",
+            sa.Column("priority", sa.String(length=20), nullable=False, server_default="normal"),
+        )
+    if "assigned_to" not in conversation_columns:
+        op.add_column(
+            "inbox_conversations",
+            sa.Column("assigned_to", sa.Uuid(), nullable=True),
+        )
+        op.create_foreign_key(
+            "fk_inbox_conversations_assigned_to_users",
+            "inbox_conversations",
+            "users",
+            ["assigned_to"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+    if "ix_inbox_conversations_priority" not in conversation_indexes:
+        op.create_index(
+            "ix_inbox_conversations_priority", "inbox_conversations", ["priority"], unique=False
+        )
+    if "ix_inbox_conversations_assigned_to" not in conversation_indexes:
+        op.create_index(
+            "ix_inbox_conversations_assigned_to",
+            "inbox_conversations",
+            ["assigned_to"],
+            unique=False,
+        )
+
+    message_columns = {item["name"] for item in inspector.get_columns("inbox_messages")}
+    message_indexes = {item["name"] for item in inspector.get_indexes("inbox_messages")}
+    if "delivery_status" not in message_columns:
+        op.add_column(
+            "inbox_messages",
+            sa.Column(
+                "delivery_status",
+                sa.String(length=40),
+                nullable=False,
+                server_default="received",
+            ),
+        )
+    if "error_message" not in message_columns:
+        op.add_column(
+            "inbox_messages",
+            sa.Column("error_message", sa.Text(), nullable=False, server_default=""),
+        )
+    if "ix_inbox_messages_delivery_status" not in message_indexes:
+        op.create_index(
+            "ix_inbox_messages_delivery_status",
+            "inbox_messages",
+            ["delivery_status"],
+            unique=False,
+        )
+
+    report_columns = {item["name"] for item in inspector.get_columns("report_schedules")}
+    if "report_days" not in report_columns:
+        op.add_column(
+            "report_schedules",
+            sa.Column("report_days", sa.Integer(), nullable=False, server_default="30"),
+        )
+    if "output_format" not in report_columns:
+        op.add_column(
+            "report_schedules",
+            sa.Column("output_format", sa.String(length=20), nullable=False, server_default="html"),
+        )
+
     for table in NEW_TABLES:
         table.create(bind, checkfirst=True)
 
