@@ -5,6 +5,7 @@ import logging
 from fasthtml.common import fast_app
 from starlette.responses import JSONResponse
 
+from fastsocial import __version__
 from fastsocial.config import settings
 from fastsocial.db import init_db
 from fastsocial.scheduler import start_scheduler
@@ -31,6 +32,7 @@ def healthz():
         {
             "status": "ok" if storage.get("ok") else "degraded",
             "service": "fastsocial",
+            "version": __version__,
             "storage": storage,
         }
     )

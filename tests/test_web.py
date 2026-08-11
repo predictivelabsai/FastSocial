@@ -156,6 +156,7 @@ def test_health_and_static_css():
         health = client.get("/healthz")
         assert health.status_code == 200
         assert health.json()["service"] == "fastsocial"
+        assert health.json()["version"] == "0.1.1"
         stylesheet = client.get("/static/app.css")
         assert stylesheet.status_code == 200
         assert "--accent" in stylesheet.text

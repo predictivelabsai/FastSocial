@@ -48,6 +48,8 @@ jobs:
       - name: Build container
         run: docker build -t fastsocial:${{ github.sha }} .
 
+  # Optional alternative to the canonical direct GitHub→Coolify repository webhook.
+  # Keep disabled while that push-only webhook is active to avoid duplicate deployments.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.USE_COOLIFY_WEBHOOK == 'true'
     needs: test
@@ -63,4 +65,3 @@ jobs:
           curl --fail --show-error --silent --retry 3 \
             "$COOLIFY_WEBHOOK_URL" \
             -H "Authorization: Bearer $COOLIFY_TOKEN"
-
