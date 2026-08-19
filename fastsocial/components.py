@@ -145,112 +145,78 @@ def sidebar(
     chat_sessions: list | None = None,
     logout_csrf: str = "",
 ):
-    nav_groups = {
-        "PUBLISH": [
-            ("Planner", "/calendar", "calendar"),
-            ("Autolists", "/autolists", "autolists"),
-            ("Posts", "/posts", "posts"),
-            ("Post Library", "/library", "library"),
-            ("Media", "/media", "media"),
-            ("SmartLinks", "/smartlinks", "smartlinks"),
-        ],
-        "MEASURE": [
-            ("Analytics", "/analytics", "analytics"),
-            ("Listening", "/listening", "listening"),
-            ("Websites", "/websites", "websites"),
-            ("Ads", "/ads", "ads"),
-        ],
-        "ANALYSE": [
-            ("Competitors", "/competitors", "competitors"),
-            ("Reports", "/reports", "reports"),
-        ],
-        "ENGAGE": [("Inbox", "/inbox", "inbox")],
-    }
+    nav_groups = [
+        (
+            "PUBLISH",
+            [
+                ("Planner", "/calendar", "calendar", None),
+                ("Autolists", "/autolists", "autolists", None),
+                ("Posts", "/posts", "posts", None),
+                ("Post Library", "/library", "library", None),
+                ("Media", "/media", "media", None),
+                ("SmartLinks", "/smartlinks", "smartlinks", None),
+            ],
+        ),
+        (
+            "MEASURE",
+            [
+                ("Analytics", "/analytics", "analytics", None),
+                ("Websites", "/websites", "websites", None),
+                ("Ads", "/ads", "ads", None),
+            ],
+        ),
+        (
+            "ANALYSE",
+            [
+                ("Listening", "/listening", "listening", None),
+                ("Competitors", "/competitors", "competitors", None),
+                ("Reports", "/reports", "reports", None),
+            ],
+        ),
+        ("ENGAGE", [("Inbox", "/inbox", "inbox", None)]),
+        (
+            "CONNECT",
+            [("Integrations", "/integrations", "integrations", len(accounts))],
+        ),
+        (
+            "MANAGE",
+            [
+                ("Brands", "/brands", "brands", len(workspaces)),
+                ("Skills", "/skills", "skills", None),
+                (
+                    "Approvals",
+                    "/approvals",
+                    "approvals",
+                    pending_approvals if pending_approvals else None,
+                ),
+                ("Team", "/team", "team", None),
+                ("Settings", "/settings", "settings", None),
+            ],
+        ),
+    ]
 
-    def nav_link(label: str, href: str, key: str):
+    def nav_link(label: str, href: str, key: str, count: int | None = None):
         return A(
             Span(ICONS[key], cls="nav-icon"),
-            Span(label),
+            Span(label, cls="nav-link-label"),
+            Span(str(count), cls="nav-count alert" if key == "approvals" else "nav-count")
+            if count is not None
+            else "",
             href=href,
             cls=f"nav-link{' active' if current_path == href or current_path.startswith(href + '/') else ''}",
         )
 
-    dashboard_link = nav_link("Dashboard", "/", "dashboard")
     grouped_navigation = [
         Details(
-            Summary(Span(label), Span("›", cls="nav-section-caret")),
+            Summary(Span(label), Span("▸", cls="nav-section-caret")),
             Div(*(nav_link(*item) for item in items), cls="nav-section-links"),
             open=any(
-                current_path == href or current_path.startswith(href + "/") for _, href, _ in items
+                current_path == href or current_path.startswith(href + "/")
+                for _, href, _, _ in items
             ),
             cls="nav-section",
         )
-        for label, items in nav_groups.items()
-    ]
-    counts = {
-        platform: sum(item.platform == platform for item in accounts) for platform in PLATFORM_NAMES
-    }
-    integration_links = [
-        A(
-            Span(ICONS["integrations"], cls="nav-icon"),
-            Span("Overview"),
-            href="/integrations",
-            cls="nav-sublink",
-        ),
-        *[
-            A(
-                Span(PLATFORM_MARKS[platform], cls=f"platform-mark {platform}"),
-                Span(name),
-                Span(str(counts[platform]), cls="nav-count"),
-                href=f"/integrations#{platform}",
-                cls="nav-sublink",
-            )
-            for platform, name in PLATFORM_NAMES.items()
-        ],
-    ]
-    integrations = Details(
-        Summary(
-            Span(ICONS["integrations"], cls="nav-icon"),
-            Span("Integrations"),
-            Span(str(len(accounts)), cls="nav-count"),
-        ),
-        Div(*integration_links, cls="nav-submenu"),
-        open=current_path.startswith("/integrations"),
-        cls=f"nav-details{' active' if current_path.startswith('/integrations') else ''}",
-    )
-    lower = [
-        A(
-            Span(ICONS["brands"], cls="nav-icon"),
-            Span("Brands"),
-            Span(str(len(workspaces)), cls="nav-count"),
-            href="/brands",
-            cls=f"nav-link{' active' if current_path.startswith('/brands') else ''}",
-        ),
-        A(
-            Span(ICONS["skills"], cls="nav-icon"),
-            Span("Skills"),
-            href="/skills",
-            cls=f"nav-link{' active' if current_path.startswith('/skills') else ''}",
-        ),
-        A(
-            Span(ICONS["approvals"], cls="nav-icon"),
-            Span("Approvals"),
-            (Span(str(pending_approvals), cls="nav-count alert") if pending_approvals else ""),
-            href="/approvals",
-            cls=f"nav-link{' active' if current_path.startswith('/approvals') else ''}",
-        ),
-        A(
-            Span(ICONS["team"], cls="nav-icon"),
-            Span("Team"),
-            href="/team",
-            cls=f"nav-link{' active' if current_path.startswith('/team') else ''}",
-        ),
-        A(
-            Span(ICONS["settings"], cls="nav-icon"),
-            Span("Settings"),
-            href="/settings",
-            cls=f"nav-link{' active' if current_path.startswith('/settings') else ''}",
-        ),
+        for label, items in nav_groups
     ]
     initials = "".join(word[:1] for word in (user.name or user.email).split())[:2].upper()
     return Aside(
@@ -302,27 +268,26 @@ def sidebar(
                 href="/new-post",
                 cls=f"new-post-link{' active' if current_path == '/new-post' else ''}",
             ),
-            Span("CHAT HISTORY", cls="nav-section-label"),
-            Div(
-                *[
-                    A(
-                        Span("●", cls="chat-session-dot"),
-                        Span(item.title, cls="chat-session-title"),
-                        href=f"/chats/{item.id}",
-                        title=item.title,
-                        cls=f"chat-session-link{' active' if current_path == f'/chats/{item.id}' else ''}",
-                    )
-                    for item in (chat_sessions or [])
-                ],
-                P("No post chats yet.", cls="chat-history-empty") if not chat_sessions else "",
-                cls="chat-history-list",
+            Details(
+                Summary(Span("CHAT HISTORY"), Span("▸", cls="nav-section-caret")),
+                Div(
+                    *[
+                        A(
+                            Span("●", cls="chat-session-dot"),
+                            Span(item.title, cls="chat-session-title"),
+                            href=f"/chats/{item.id}",
+                            title=item.title,
+                            cls=f"chat-session-link{' active' if current_path == f'/chats/{item.id}' else ''}",
+                        )
+                        for item in (chat_sessions or [])
+                    ],
+                    P("No post chats yet.", cls="chat-history-empty") if not chat_sessions else "",
+                    cls="chat-history-list",
+                ),
+                open=current_path.startswith("/chats"),
+                cls="nav-section chat-history-section",
             ),
-            dashboard_link,
             *grouped_navigation,
-            Span("CONNECT", cls="nav-section-label"),
-            integrations,
-            Span("MANAGE", cls="nav-section-label"),
-            *lower,
             cls="sidebar-nav",
         ),
         Div(
