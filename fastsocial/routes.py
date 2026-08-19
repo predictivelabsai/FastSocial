@@ -434,7 +434,12 @@ def _landing():
                 Div(
                     Span("FastSocial"),
                     Small("Part of the FastSME open business software portfolio."),
-                    A("View on GitHub ↗", href="https://github.com/predictivelabsai/FastSocial", target="_blank", rel="noopener noreferrer"),
+                    A(
+                        "View on GitHub ↗",
+                        href="https://github.com/predictivelabsai/FastSocial",
+                        target="_blank",
+                        rel="noopener noreferrer",
+                    ),
                     cls="public-footer",
                 ),
                 cls="public-shell",
