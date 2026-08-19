@@ -47,7 +47,8 @@ h1, h2, h3 { font-family: "Manrope", sans-serif; letter-spacing: -0.025em; }
 .workspace-option-check { margin-left: auto; color: #83c7a9; }
 .workspace-manage-link { padding: 8px; color: #83a497; font-size: 9px; font-weight: 700; text-align: center; }
 .workspace-manage-link:hover { color: white; }
-.sidebar-nav { padding: 5px 10px; overflow-y: auto; flex: 1; }
+.sidebar-nav { padding: 5px 10px; overflow-y: auto; overflow-x: hidden; flex: 1; scrollbar-width: none; }
+.sidebar-nav::-webkit-scrollbar, .chat-history-list::-webkit-scrollbar, .creation-message-scroll::-webkit-scrollbar, .creation-artifact-body::-webkit-scrollbar { display: none; }
 .new-post-link { min-height: 42px; margin: 2px 0 8px; padding: 0 12px; display: flex; align-items: center; gap: 10px; border-radius: 9px; color: white; background: var(--accent); font-size: 13px; font-weight: 700; }
 .new-post-link:hover, .new-post-link.active { background: var(--accent-dark); }
 .chat-history-list { display: grid; gap: 2px; max-height: 185px; overflow-y: auto; }
@@ -57,6 +58,12 @@ h1, h2, h3 { font-family: "Manrope", sans-serif; letter-spacing: -0.025em; }
 .chat-session-title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .chat-history-empty { margin: 4px 9px 8px; color: #6f877d; font-size: 10px; }
 .nav-section-label { margin: 14px 10px 6px; }
+.nav-section { margin-top: 7px; }
+.nav-section > summary { padding: 7px 10px 5px; display: flex; align-items: center; justify-content: space-between; color: #789087; cursor: pointer; list-style: none; font-size: 10px; font-weight: 700; letter-spacing: .13em; }
+.nav-section > summary::-webkit-details-marker { display: none; }
+.nav-section-caret { font-size: 15px; line-height: 1; transition: transform .15s ease; }
+.nav-section[open] .nav-section-caret { transform: rotate(90deg); }
+.nav-section-links { display: grid; }
 .nav-link, .nav-details > summary { min-height: 39px; padding: 0 11px; display: flex; align-items: center; gap: 11px; border-radius: 8px; color: #aabdb5; font-size: 13px; font-weight: 500; list-style: none; }
 .nav-details > summary::-webkit-details-marker { display:none; }
 .nav-link:hover, .nav-details > summary:hover, .nav-link.active, .nav-details.active > summary { color: white; background: var(--sidebar-soft); }
@@ -193,7 +200,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .creation-page-shell { height: 100%; min-height: 0; display: flex; flex-direction: column; }
 .chat-sse-root, .chat-live-fragment { height: 100%; min-height: 0; }
 .creation-page-shell > .flash { margin: 12px 18px 0; flex: 0 0 auto; }
-.creation-workspace { height: 100%; min-height: 0; display: grid; grid-template-columns: minmax(500px, 1fr) 420px; background: var(--paper); }
+.creation-workspace { position: relative; height: 100%; min-height: 0; display: grid; grid-template-columns: minmax(500px, 1fr) 420px; background: var(--paper); }
+.creation-workspace:has(.artifact-pane-toggle:checked) { grid-template-columns: minmax(0, 1fr) 0; }
+.creation-workspace:has(.artifact-pane-toggle:checked) .creation-artifact-pane { display: none; }
+.artifact-pane-toggle { position: fixed; opacity: 0; pointer-events: none; }
 .creation-page-shell > .creation-workspace { height: auto; flex: 1; }
 .creation-chat-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: white; }
 .creation-artifact-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: #f8faf9; }
@@ -203,9 +213,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .creation-pane-head h2 { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 14px; }
 .creation-pane-head small { color: var(--muted); font-size: 9px; }
 .artifact-pane-head { background: #f8faf9; }
+.artifact-head-actions { display: flex; align-items: center; gap: 8px; }
+.pane-toggle { min-width: 31px; height: 28px; padding: 0 7px; display: inline-grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: white; cursor: pointer; font-size: 11px; font-weight: 800; letter-spacing: -.08em; }
+.pane-toggle:hover { color: var(--accent-dark); border-color: var(--accent); background: var(--accent-soft); }
+.artifact-expand { position: absolute; right: 0; top: 14px; z-index: 3; display: none; border-radius: 7px 0 0 7px; }
+.creation-workspace:has(.artifact-pane-toggle:checked) .artifact-expand { display: inline-grid; }
 .artifact-title-icon { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 8px; color: var(--accent-dark); background: var(--accent-soft); }
 .artifact-status { padding: 4px 8px; border-radius: 20px; color: var(--muted); background: white; border: 1px solid var(--line); font-size: 8px; font-weight: 800; letter-spacing: .08em; }
-.creation-message-scroll { min-height: 0; padding: 28px clamp(24px, 6vw, 80px); display: flex; flex: 1; flex-direction: column; gap: 18px; overflow-y: auto; scroll-behavior: smooth; }
+.creation-message-scroll { min-height: 0; padding: 28px clamp(24px, 6vw, 80px); display: flex; flex: 1; flex-direction: column; gap: 18px; overflow-y: auto; scroll-behavior: smooth; scrollbar-width: none; }
 .creation-message-scroll.empty-conversation { justify-content: center; align-items: center; }
 .creation-welcome { width: min(590px, 100%); text-align: center; }
 .creation-welcome-icon { width: 48px; height: 48px; margin: 0 auto 16px; display: grid; place-items: center; border-radius: 15px; color: white; background: var(--accent); box-shadow: 0 10px 25px rgba(79,143,115,.22); font-size: 20px; }
@@ -262,7 +277,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .chat-schedule-action { display: flex; gap: 5px; }
 .chat-schedule-action input { width: 172px; min-height: 32px; padding: 5px 8px; border-radius: 18px; font-size: 9px; }
 .creation-complete-dock { padding: 16px clamp(24px, 6vw, 80px) 20px; border-top: 1px solid var(--line); }
-.creation-artifact-body { min-height: 0; padding: 18px; display: grid; align-content: start; gap: 12px; overflow-y: auto; }
+.creation-artifact-body { min-height: 0; padding: 18px; display: grid; align-content: start; gap: 12px; overflow-y: auto; scrollbar-width: none; }
 .artifact-empty { margin: auto; padding: 36px 24px; color: var(--muted); text-align: center; }
 .artifact-empty h2 { margin: 12px 0 7px; color: var(--ink); font-size: 16px; }
 .artifact-empty p { margin: 0 auto; max-width: 290px; font-size: 11px; line-height: 1.55; }

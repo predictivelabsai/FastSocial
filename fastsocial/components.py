@@ -145,30 +145,47 @@ def sidebar(
     chat_sessions: list | None = None,
     logout_csrf: str = "",
 ):
-    items = [
-        ("Dashboard", "/", "dashboard"),
-        ("Planner", "/calendar", "calendar"),
-        ("Autolists", "/autolists", "autolists"),
-        ("Posts", "/posts", "posts"),
-        ("Post Library", "/library", "library"),
-        ("Media", "/media", "media"),
-        ("Analytics", "/analytics", "analytics"),
-        ("Listening", "/listening", "listening"),
-        ("Websites", "/websites", "websites"),
-        ("Ads", "/ads", "ads"),
-        ("Competitors", "/competitors", "competitors"),
-        ("Inbox", "/inbox", "inbox"),
-        ("Reports", "/reports", "reports"),
-        ("SmartLinks", "/smartlinks", "smartlinks"),
-    ]
-    main_links = [
-        A(
+    nav_groups = {
+        "PUBLISH": [
+            ("Planner", "/calendar", "calendar"),
+            ("Autolists", "/autolists", "autolists"),
+            ("Posts", "/posts", "posts"),
+            ("Post Library", "/library", "library"),
+            ("Media", "/media", "media"),
+            ("SmartLinks", "/smartlinks", "smartlinks"),
+        ],
+        "MEASURE": [
+            ("Analytics", "/analytics", "analytics"),
+            ("Listening", "/listening", "listening"),
+            ("Websites", "/websites", "websites"),
+            ("Ads", "/ads", "ads"),
+        ],
+        "ANALYSE": [
+            ("Competitors", "/competitors", "competitors"),
+            ("Reports", "/reports", "reports"),
+        ],
+        "ENGAGE": [("Inbox", "/inbox", "inbox")],
+    }
+
+    def nav_link(label: str, href: str, key: str):
+        return A(
             Span(ICONS[key], cls="nav-icon"),
             Span(label),
             href=href,
-            cls=f"nav-link{' active' if current_path == href or (href != '/' and current_path.startswith(href)) else ''}",
+            cls=f"nav-link{' active' if current_path == href or current_path.startswith(href + '/') else ''}",
         )
-        for label, href, key in items
+
+    dashboard_link = nav_link("Dashboard", "/", "dashboard")
+    grouped_navigation = [
+        Details(
+            Summary(Span(label), Span("›", cls="nav-section-caret")),
+            Div(*(nav_link(*item) for item in items), cls="nav-section-links"),
+            open=any(
+                current_path == href or current_path.startswith(href + "/") for _, href, _ in items
+            ),
+            cls="nav-section",
+        )
+        for label, items in nav_groups.items()
     ]
     counts = {
         platform: sum(item.platform == platform for item in accounts) for platform in PLATFORM_NAMES
@@ -300,8 +317,8 @@ def sidebar(
                 P("No post chats yet.", cls="chat-history-empty") if not chat_sessions else "",
                 cls="chat-history-list",
             ),
-            Span("PUBLISH", cls="nav-section-label"),
-            *main_links,
+            dashboard_link,
+            *grouped_navigation,
             Span("CONNECT", cls="nav-section-label"),
             integrations,
             Span("MANAGE", cls="nav-section-label"),

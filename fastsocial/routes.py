@@ -1170,7 +1170,17 @@ def _new_post_form(
     artifact_panel = Aside(
         Div(
             Div(Span("✦", cls="artifact-title-icon"), H2("Artifacts")),
-            Span("Waiting", cls="artifact-status"),
+            Div(
+                Span("Waiting", cls="artifact-status"),
+                Label(
+                    "<<",
+                    cls="pane-toggle pane-collapse",
+                    title="Collapse artifacts",
+                    aria_label="Collapse artifacts",
+                    fr="artifact-pane-toggle",
+                ),
+                cls="artifact-head-actions",
+            ),
             cls="creation-pane-head artifact-pane-head",
         ),
         Div(
@@ -1212,12 +1222,8 @@ def _new_post_form(
     return Div(
         flash(error, "error"),
         Div(
+            Input(type="checkbox", id="artifact-pane-toggle", cls="artifact-pane-toggle"),
             Section(
-                Div(
-                    Div(H2("New post"), Small("Agentic creation workspace")),
-                    Span("READY", cls="mode-badge"),
-                    cls="creation-pane-head",
-                ),
                 Div(
                     Div(
                         Span("✦", cls="creation-welcome-icon"),
@@ -1233,6 +1239,13 @@ def _new_post_form(
                 cls="creation-chat-pane",
             ),
             artifact_panel,
+            Label(
+                ">>",
+                cls="pane-toggle artifact-expand",
+                title="Expand artifacts",
+                aria_label="Expand artifacts",
+                fr="artifact-pane-toggle",
+            ),
             cls="creation-workspace new-creation-workspace",
         ),
         cls="creation-page-shell",
