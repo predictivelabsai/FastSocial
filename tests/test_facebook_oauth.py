@@ -268,7 +268,12 @@ def test_facebook_callback_shows_page_picker_for_multiple_pages(monkeypatch):
             )
             assert account is not None
             assert account.display_name == "Page B"
-            assert session.scalar(select(SocialAccount).where(SocialAccount.external_account_id == "page-a")) is None
+            assert (
+                session.scalar(
+                    select(SocialAccount).where(SocialAccount.external_account_id == "page-a")
+                )
+                is None
+            )
 
 
 def test_facebook_callback_rejects_invalid_state(monkeypatch):
