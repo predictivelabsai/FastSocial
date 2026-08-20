@@ -278,5 +278,13 @@ def test_public_discovery_files_use_python_routes():
 
         sitemap = client.get("/sitemap.xml")
         assert sitemap.status_code == 200
+        assert "/privacy" in sitemap.text
+        assert "/data-deletion" in sitemap.text
+        privacy = client.get("/privacy")
+        assert privacy.status_code == 200
+        assert "encrypted OAuth" in privacy.text
+        deletion = client.get("/data-deletion")
+        assert deletion.status_code == 200
+        assert "disconnect" in deletion.text.lower()
         assert sitemap.headers["content-type"].startswith("application/xml")
         assert "<urlset" in sitemap.text

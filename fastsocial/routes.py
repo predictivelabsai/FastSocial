@@ -187,6 +187,20 @@ from fastsocial.services import (
     workspace_for_user,
 )
 from fastsocial.skills_service import publish_skill_version, skill_content
+from fastsocial.social.base import SocialAPIError
+from fastsocial.social.facebook import (
+    FACEBOOK_SCOPES,
+    clear_facebook_page_selection,
+    exchange_facebook_code,
+    exchange_long_lived_token,
+    facebook_configured,
+    facebook_oauth_url,
+    facebook_profile,
+    list_facebook_pages,
+    load_facebook_page_selection,
+    parse_facebook_signed_request,
+    stash_facebook_page_selection,
+)
 from fastsocial.social.mcp import ManagedMCPClient
 from fastsocial.storage import LocalStorage, media_storage
 
@@ -465,8 +479,57 @@ def sitemap():
         f"<url><loc>{base}/</loc></url>"
         f"<url><loc>{base}/signin</loc></url>"
         f"<url><loc>{base}/register</loc></url>"
+        f"<url><loc>{base}/privacy</loc></url>"
+        f"<url><loc>{base}/data-deletion</loc></url>"
         "</urlset>",
         media_type="application/xml",
+    )
+
+
+@rt("/privacy")
+def privacy_page():
+    return auth_page(
+        "Privacy",
+        "How FastSocial handles social connection data.",
+        P(
+            "FastSocial stores encrypted OAuth and Page access tokens, Page identifiers, "
+            "granted scopes, published post IDs, and the engagement metrics those connections collect."
+        ),
+        P(
+            "Tokens are encrypted at rest. FastSocial does not sell personal data. You can disconnect "
+            "a social account from Integrations at any time, which clears stored tokens."
+        ),
+        P(
+            "Meta users can also request deletion through the data-deletion callback registered "
+            "for the FastSocial Facebook app."
+        ),
+        Div(
+            A("Data deletion", href="/data-deletion", cls="btn"),
+            A("Sign in", href="/signin", cls="btn primary"),
+            cls="form-actions left",
+        ),
+    )
+
+
+@rt("/data-deletion")
+def data_deletion_page():
+    return auth_page(
+        "Data deletion",
+        "Remove FastSocial's copy of your connected social data.",
+        P(
+            "Sign in, open Integrations, and disconnect the Facebook Page. That clears the encrypted "
+            "Page token and stops publishing and collection for that Page."
+        ),
+        P(
+            "If you remove FastSocial from Facebook settings, Meta calls our data-deletion callback "
+            "and we disable matching Page connections that stored your Facebook user ID."
+        ),
+        P(f"Callback URL: {settings().service_url}/oauth/facebook/data-deletion", cls="mono"),
+        Div(
+            A("Privacy", href="/privacy", cls="btn"),
+            A("Sign in", href="/signin", cls="btn primary"),
+            cls="form-actions left",
+        ),
     )
 
 
@@ -3879,6 +3942,7 @@ def _integration_card(platform: str, accounts: list[SocialAccount]):
         "x": bool(settings().x_client_id and settings().x_client_secret),
         "linkedin": bool(settings().linkedin_client_id and settings().linkedin_client_secret),
         "bluesky": settings().bluesky_app_password_enabled,
+        "facebook": facebook_configured(),
     }.get(platform, False)
     paths = [
         (
@@ -3961,7 +4025,7 @@ def _integration_card(platform: str, accounts: list[SocialAccount]):
                 "x": "Publish posts and collect public and authorized metrics.",
                 "linkedin": "Publish personal or organization content using LinkedIn's versioned Posts API.",
                 "bluesky": "Publish through the open AT Protocol using a revocable app password.",
-                "facebook": "Plan Pages content, collect engagement, moderate comments, and connect Meta Ads.",
+                "facebook": "Publish to Facebook Pages you manage through direct Meta OAuth. Comments, inbox, Ads, and Instagram are later phases.",
                 "instagram": "Publish visual content, collect Insights, comments, Reels, and Stories metrics.",
                 "threads": "Publish and measure Threads content through a managed official connector.",
                 "tiktok": "Schedule short-form video, collect performance, comments, and TikTok Ads metrics.",
@@ -5021,7 +5085,7 @@ async def integration_connect(platform: str, provider: str, request, sess):
                     {"provider": "mock"},
                 )
             return RedirectResponse(f"/integrations?saved=1#{platform}", status_code=303)
-    if provider_enum == ConnectionProvider.direct and platform in {"x", "linkedin"}:
+    if provider_enum == ConnectionProvider.direct and platform in {"x", "linkedin", "facebook"}:
         return RedirectResponse(f"/oauth/{platform}/start", status_code=303)
     if provider_enum == ConnectionProvider.direct and platform != "bluesky":
         return RedirectResponse(
@@ -5329,6 +5393,277 @@ async def linkedin_oauth_callback(code: str = "", state: str = "", error: str = 
             {"provider": "direct"},
         )
     return RedirectResponse("/integrations?saved=1#linkedin", status_code=303)
+
+
+def _facebook_page_task_label(page: dict) -> str:
+    tasks = ", ".join(page.get("tasks") or [])
+    if page.get("can_publish", True):
+        return "Publishing permitted" + (f" · {tasks}" if tasks else "")
+    return "Limited Page tasks" + (f" · {tasks}" if tasks else "")
+
+
+def _save_facebook_page(
+    ctx,
+    page: dict,
+    facebook_user_id: str = "",
+    *,
+    long_lived: bool = True,
+    user_token_expires_in: int = 0,
+) -> None:
+    tasks = [str(task) for task in (page.get("tasks") or [])]
+    metadata = {
+        "page_id": page["id"],
+        "tasks": tasks,
+        "token_type": "page",
+        "granted_scopes": list(FACEBOOK_SCOPES),
+        "facebook_user_id": facebook_user_id,
+        "can_publish": bool(page.get("can_publish", True)),
+        "long_lived": bool(long_lived),
+    }
+    # A Page token derived from a long-lived user token does not expire; if the long-lived
+    # exchange failed we fell back to the short-lived token, so record when to re-authorize.
+    if long_lived:
+        expires_at = None
+    else:
+        expires_at = utcnow() + timedelta(seconds=int(user_token_expires_in or 3600))
+    with session_scope() as session:
+        existing = session.scalar(
+            select(SocialAccount).where(
+                SocialAccount.workspace_id == ctx.workspace.id,
+                SocialAccount.platform == "facebook",
+                SocialAccount.provider == ConnectionProvider.direct,
+                SocialAccount.external_account_id == page["id"],
+            )
+        )
+        if existing:
+            existing.username = page.get("name") or existing.username
+            existing.display_name = page.get("name") or existing.display_name
+            existing.avatar_url = page.get("picture") or existing.avatar_url
+            existing.access_token_encrypted = encrypt_text(page["access_token"])
+            existing.scopes = list(FACEBOOK_SCOPES)
+            existing.account_metadata = {**existing.account_metadata, **metadata}
+            existing.status = AccountStatus.connected
+            existing.last_error = ""
+            existing.token_expires_at = expires_at
+            account = existing
+            action = "integration.reconnected"
+        else:
+            account = SocialAccount(
+                workspace_id=ctx.workspace.id,
+                platform="facebook",
+                provider=ConnectionProvider.direct,
+                external_account_id=page["id"],
+                username=page.get("name") or page["id"],
+                display_name=page.get("name") or "Facebook Page",
+                avatar_url=page.get("picture") or "",
+                access_token_encrypted=encrypt_text(page["access_token"]),
+                scopes=list(FACEBOOK_SCOPES),
+                account_metadata=metadata,
+                token_expires_at=expires_at,
+            )
+            session.add(account)
+            action = "integration.connected"
+        session.flush()
+        audit(
+            session,
+            ctx.workspace.id,
+            ctx.user.id,
+            action,
+            account,
+            {"provider": "direct", "page_id": page["id"]},
+        )
+
+
+def _facebook_page_picker(ctx, sess, pages: list[dict], error: str = ""):
+    options = [
+        Label(
+            Input(
+                type="radio",
+                name="page_id",
+                value=page["id"],
+                required=True,
+                checked=index == 0,
+            ),
+            Div(
+                Span(page["name"]),
+                Small(_facebook_page_task_label(page)),
+            ),
+            cls="account-option",
+        )
+        for index, page in enumerate(pages)
+    ]
+    return _app_page(
+        ctx,
+        "Select Facebook Page",
+        "/integrations",
+        page_intro(
+            "FACEBOOK",
+            "Choose a Page to connect",
+            "FastSocial stores the encrypted Page access token for the Page you select. "
+            "Only Pages you manage are listed.",
+        ),
+        flash(error, "error"),
+        Form(
+            csrf_input(sess),
+            Div(*options, cls="account-options"),
+            Div(
+                A("Cancel", href="/integrations#facebook", cls="btn"),
+                Button("Connect Page", type="submit", cls="btn primary"),
+                cls="form-actions",
+            ),
+            method="post",
+            action="/oauth/facebook/pages",
+            cls="form-card",
+        ),
+    )
+
+
+@rt("/oauth/facebook/start")
+def facebook_oauth_start(sess):
+    ctx = _context(sess)
+    if not ctx or not facebook_configured():
+        return RedirectResponse(
+            "/integrations?error=Facebook+OAuth+is+not+configured", status_code=303
+        )
+    state = secrets.token_urlsafe(32)
+    sess["facebook_oauth_state"] = state
+    clear_facebook_page_selection(sess)
+    return RedirectResponse(facebook_oauth_url(state), status_code=302)
+
+
+@rt("/oauth/facebook/callback")
+async def facebook_oauth_callback(code: str = "", state: str = "", error: str = "", sess=None):
+    ctx = _context(sess)
+    if (
+        not ctx
+        or error
+        or not state
+        or not secrets.compare_digest(state, sess.pop("facebook_oauth_state", ""))
+    ):
+        return RedirectResponse(
+            "/integrations?error=Facebook+authorization+failed", status_code=303
+        )
+    try:
+        tokens = await exchange_facebook_code(code)
+        long_lived = await exchange_long_lived_token(tokens["access_token"])
+        user_token = str(long_lived.get("access_token") or tokens["access_token"])
+        profile = await facebook_profile(user_token)
+        pages = await list_facebook_pages(user_token)
+    except (SocialAPIError, httpx.HTTPError):
+        log.exception("Facebook OAuth callback failed")
+        return RedirectResponse(
+            "/integrations?error=Facebook+token+exchange+failed", status_code=303
+        )
+    long_lived_ok = bool(long_lived.get("long_lived"))
+    user_token_expires_in = int(long_lived.get("expires_in") or 0)
+    publishable = [page for page in pages if page.get("can_publish", True)]
+    usable = publishable or pages
+    if not usable:
+        return RedirectResponse(
+            "/integrations?error=No+Facebook+Pages+with+publishing+access+were+returned",
+            status_code=303,
+        )
+    facebook_user_id = str(profile.get("id") or "")
+    if len(usable) == 1:
+        _save_facebook_page(
+            ctx,
+            usable[0],
+            facebook_user_id,
+            long_lived=long_lived_ok,
+            user_token_expires_in=user_token_expires_in,
+        )
+        return RedirectResponse("/integrations?saved=1#facebook", status_code=303)
+    stash_facebook_page_selection(
+        sess,
+        {
+            "pages": usable,
+            "facebook_user_id": facebook_user_id,
+            "long_lived": long_lived_ok,
+            "user_token_expires_in": user_token_expires_in,
+        },
+    )
+    return RedirectResponse("/oauth/facebook/pages", status_code=303)
+
+
+@rt("/oauth/facebook/pages", methods=["GET", "POST"])
+async def facebook_oauth_pages(request, sess):
+    ctx = _context(sess)
+    if not ctx:
+        return _signin_redirect()
+    pending = load_facebook_page_selection(sess)
+    if not pending:
+        return RedirectResponse(
+            "/integrations?error=Facebook+Page+selection+expired.+Connect+again",
+            status_code=303,
+        )
+    pages = list(pending.get("pages") or [])
+    error = ""
+    if request.method == "POST":
+        form = await request.form()
+        if not verify_csrf(sess, form.get("csrf")):
+            error = "Your session expired."
+        else:
+            selected_id = str(form.get("page_id") or "").strip()
+            page = next((item for item in pages if item.get("id") == selected_id), None)
+            if not page:
+                error = "Select a Facebook Page you manage."
+            else:
+                _save_facebook_page(
+                    ctx,
+                    page,
+                    str(pending.get("facebook_user_id") or ""),
+                    long_lived=bool(pending.get("long_lived", True)),
+                    user_token_expires_in=int(pending.get("user_token_expires_in") or 0),
+                )
+                clear_facebook_page_selection(sess)
+                return RedirectResponse("/integrations?saved=1#facebook", status_code=303)
+    return _facebook_page_picker(ctx, sess, pages, error)
+
+
+@rt("/oauth/facebook/data-deletion", methods=["GET", "POST"])
+async def facebook_data_deletion(request):
+    if request.method == "GET":
+        return RedirectResponse("/data-deletion", status_code=303)
+    form = await request.form()
+    signed_request = str(form.get("signed_request") or "")
+    if not signed_request or not facebook_configured():
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    try:
+        payload = parse_facebook_signed_request(signed_request, settings().meta_app_secret)
+    except (SocialAPIError, ValueError, json.JSONDecodeError):
+        return JSONResponse({"error": "invalid signed request"}, status_code=400)
+    user_id = str(payload.get("user_id") or "")
+    confirmation = secrets.token_urlsafe(12)
+    if user_id:
+        with session_scope() as session:
+            # The facebook_user_id lives in the JSON metadata column; matching it in SQL
+            # differs between SQLite (tests) and PostgreSQL (production), so filter the
+            # portable columns here and match the user ID in Python. Already-disabled
+            # accounts are skipped since their tokens are cleared already.
+            accounts = list(
+                session.scalars(
+                    select(SocialAccount).where(
+                        SocialAccount.platform == "facebook",
+                        SocialAccount.provider == ConnectionProvider.direct,
+                        SocialAccount.status != AccountStatus.disabled,
+                    )
+                )
+            )
+            for account in accounts:
+                metadata = account.account_metadata or {}
+                if metadata.get("facebook_user_id") == user_id:
+                    account.status = AccountStatus.disabled
+                    account.access_token_encrypted = None
+                    account.refresh_token_encrypted = None
+                    account.last_error = "Deleted after Facebook data-deletion callback"
+                    metadata = {**metadata, "deleted_via": "facebook_data_deletion"}
+                    account.account_metadata = metadata
+    return JSONResponse(
+        {
+            "url": f"{settings().service_url}/data-deletion",
+            "confirmation_code": confirmation,
+        }
+    )
 
 
 @rt("/integrations/accounts/{account_id}")

@@ -225,3 +225,6 @@ data/
 dist/
 build/
 *.egg-info/
+.secrets/
+secrets.env
+oauth.env

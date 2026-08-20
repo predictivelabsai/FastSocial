@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     linkedin_client_secret: str = Field("", alias="LINKEDIN_CLIENT_SECRET")
     linkedin_api_version: str = Field("202606", alias="LINKEDIN_API_VERSION")
     bluesky_app_password_enabled: bool = Field(True, alias="BLUESKY_APP_PASSWORD_ENABLED")
+    meta_app_id: str = Field("", alias="META_APP_ID")
+    meta_app_secret: str = Field("", alias="META_APP_SECRET")
+    meta_graph_api_version: str = Field("v25.0", alias="META_GRAPH_API_VERSION")
 
     arcade_api_key: str = Field("", alias="ARCADE_API_KEY")
     arcade_mcp_url: str = Field("", alias="ARCADE_MCP_URL")
@@ -78,6 +81,14 @@ class Settings(BaseSettings):
     @classmethod
     def trim_service_url(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("meta_graph_api_version")
+    @classmethod
+    def normalize_meta_graph_api_version(cls, value: str) -> str:
+        cleaned = (value or "").strip() or "v25.0"
+        if not cleaned.startswith("v"):
+            cleaned = f"v{cleaned}"
+        return cleaned
 
     @property
     def production(self) -> bool:

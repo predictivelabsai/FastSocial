@@ -75,16 +75,24 @@ the deterministic mock provider and cannot post to a real network.
 ## Connection modes
 
 `direct` stores encrypted platform tokens in PostgreSQL. X uses OAuth 2.0 with PKCE, LinkedIn uses
-three-legged OAuth, and Bluesky uses a dedicated app password.
+three-legged OAuth, Facebook Pages uses Meta OAuth with Page selection, and Bluesky uses a dedicated
+app password.
 
 `arcade` and `composio` store only managed account/tool identifiers. FastSocial calls a configured
 MCP gateway; the provider owns downstream authorization and refresh. Configure each supported tool
 name independently on the integration page because gateway catalog names are deployment-specific.
 
+FastSocial also exposes its own MCP endpoint at `/mcp` so an assistant or automation platform can
+list posts, create/schedule drafts, and read analytics using a scoped automation token. Both
+directions — connecting out to Arcade/Composio and driving FastSocial over MCP — are documented in
+[docs/mcp_integration.md](docs/mcp_integration.md), including a rollout plan for the managed
+connectors.
+
 Current reference documentation:
 
 - [X create post and media APIs](https://docs.x.com/x-api/posts/create-post)
 - [LinkedIn Posts API](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api)
+- [Facebook Pages publishing](https://developers.facebook.com/docs/pages-api/posts)
 - [Arcade MCP gateways](https://docs.arcade.dev/en/guides/mcp-gateways)
 - [Composio connected accounts](https://docs.composio.dev/docs/auth-configuration/connected-accounts)
 

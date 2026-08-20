@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastsocial.models import ConnectionProvider, SocialAccount
 from fastsocial.social.base import SocialClient
 from fastsocial.social.direct import BlueskyClient, LinkedInClient, MockClient, XClient
+from fastsocial.social.facebook import FacebookClient
 from fastsocial.social.mcp import ManagedMCPClient
 
 
@@ -11,7 +12,12 @@ def client_for(account: SocialAccount) -> SocialClient:
         return MockClient()
     if account.provider in {ConnectionProvider.arcade, ConnectionProvider.composio}:
         return ManagedMCPClient(account.provider)
-    clients = {"x": XClient, "linkedin": LinkedInClient, "bluesky": BlueskyClient}
+    clients = {
+        "x": XClient,
+        "linkedin": LinkedInClient,
+        "bluesky": BlueskyClient,
+        "facebook": FacebookClient,
+    }
     try:
         return clients[account.platform]()
     except KeyError as exc:
