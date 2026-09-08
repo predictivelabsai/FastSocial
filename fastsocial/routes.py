@@ -403,6 +403,7 @@ def _landing():
                         cls="brand public-brand",
                     ),
                     Div(
+                        A("Pricing", href="#pricing", cls="btn"),
                         A("Sign in", href="/signin", cls="btn"),
                         A("Start free", href="/register", cls="btn primary"),
                         cls="public-actions",
@@ -434,6 +435,19 @@ def _landing():
                         for index, (title, copy) in enumerate(features)
                     ],
                     cls="public-features",
+                ),
+
+                Div(
+                    Span("PRICING", cls="eyebrow accent"),
+                    H2("Simple pricing for every FastSME product."),
+                    P("Every Fast* product uses the same two options: bring your own cloud for free, or host with us for €1 per month."),
+                    Div(
+                        Div(Span("BYOC", cls="feature-number"), H2("Bring Your Own Cloud"), P(Strong("Free")), P("Self-host on your own infrastructure or cloud. Full control of data and upgrades. No per-seat platform fee."), cls="public-feature"),
+                        Div(Span("HOSTED", cls="feature-number"), H2("Host with us"), P(Strong("€1 / month")), P("We run the product for you on FastSME-managed infrastructure. €1 per product per month."), cls="public-feature"),
+                        cls="public-features",
+                    ),
+                    id="pricing",
+                    cls="public-hero",
                 ),
                 Div(
                     Div(
